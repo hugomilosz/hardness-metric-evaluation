@@ -17,7 +17,7 @@ class LossTracker:
         """Update with a single epoch-level loss"""
         self.current_epoch_losses.append(loss)
     
-    def finalize_epoch(self):
+    def finalise_epoch(self):
         """End of epoch"""
         if self.current_epoch_losses:
             epoch_avg_loss = np.mean(self.current_epoch_losses)
@@ -41,22 +41,21 @@ class ForgettingTracker:
     def __init__(self, total_samples):
         self.last_correct = {i: False for i in range(total_samples)}
         self.forgetting_events = {i: -1 for i in range(total_samples)}
-        self.samples_seen_this_epoch = set()
     
     def update(self, correct_predictions, sample_indices):
         """Update forgetting events for a batch"""
         for is_correct, sample_idx in zip(correct_predictions, sample_indices):
             if is_correct:
+                # first time learnt
                 if self.forgetting_events[sample_idx] == -1:
                     self.forgetting_events[sample_idx] = 0
                 if not self.last_correct[sample_idx]:
                     self.last_correct[sample_idx] = True
             else:
+                # forgotten
                 if self.last_correct[sample_idx]:
                     self.forgetting_events[sample_idx] += 1
                     self.last_correct[sample_idx] = False
-            
-            self.samples_seen_this_epoch.add(sample_idx)
     
     def get_stats(self):
         """Get forgetting statistics"""
@@ -70,6 +69,4 @@ class ForgettingTracker:
         return {
             'forgetting_events': self.forgetting_events,
             'forgettable_examples': forgettable_examples,
-            'total_forgettable': len(forgettable_examples),
-            'average_forgetting_events': np.mean(forgetting_values) if forgetting_values else 0.0,
         }

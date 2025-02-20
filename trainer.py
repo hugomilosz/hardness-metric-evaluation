@@ -8,7 +8,7 @@ from methods import ForgettingTracker
 class CustomTrainer(Trainer):
     def __init__(self, *args, methods=None, **kwargs):
         super().__init__(*args, **kwargs)
-        
+    
         self.methods = methods or []
         self.total_samples = len(self.train_dataset)
         
@@ -25,8 +25,8 @@ class CustomTrainer(Trainer):
         logits = outputs.logits
         labels = inputs["labels"]
         
-        loss_fct = torch.nn.CrossEntropyLoss(reduction="none")
-        per_sample_losses = loss_fct(logits.view(-1, self.model.config.num_labels), labels.view(-1))
+        per_sample_loss_fct = torch.nn.CrossEntropyLoss(reduction="none")
+        per_sample_losses = per_sample_loss_fct(logits.view(-1, self.model.config.num_labels), labels.view(-1))
         
         batch_size = labels.size(0)
         start_idx = (self.global_step % (self.total_samples // self.args.per_device_train_batch_size)) * self.args.per_device_train_batch_size
@@ -46,8 +46,15 @@ class CustomTrainer(Trainer):
             self.forgetting_tracker.update(correct_predictions, dataset_indices)
 
         self.global_step += 1
-        mean_loss = per_sample_losses.mean()
-        return (mean_loss, outputs) if return_outputs else mean_loss
+        # mean_loss = per_sample_losses.mean()
+        # return (mean_loss, outputs) if return_outputs else mean_loss
+
+        loss_fct = torch.nn.CrossEntropyLoss()
+        loss = loss_fct(logits.view(-1, self.model.config.num_labels), labels.view(-1))
+
+        if return_outputs:
+            return loss, outputs
+        return loss
 
     def training_step(self, *args, **kwargs):
         """Track per-batch loss."""
@@ -59,7 +66,7 @@ class CustomTrainer(Trainer):
     def evaluate(self, *args, **kwargs):
         """On end of epoch, finalise epoch loss tracking."""
         if self.loss_tracker:
-            epoch_avg_loss = self.loss_tracker.finalize_epoch()
+            epoch_avg_loss = self.loss_tracker.finalise_epoch()
             if epoch_avg_loss is not None:
                 print(f"\nEpoch {len(self.loss_tracker.epoch_losses)} Summary:")
                 print(f"Average Loss: {epoch_avg_loss:.4f}")
@@ -67,12 +74,10 @@ class CustomTrainer(Trainer):
         return super().evaluate(*args, **kwargs)
 
     def get_unified_stats(self):
-        """Return statis for enabled tracking methods"""
+        """Return stats for enabled tracking methods"""
         stats = {}
-        
         if self.loss_tracker:
             stats['loss_stats'] = self.loss_tracker.get_stats()
-            
         if self.forgetting_tracker:
             stats['forgetting_stats'] = self.forgetting_tracker.get_stats()
             
