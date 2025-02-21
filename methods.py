@@ -3,20 +3,42 @@ import numpy as np
 
 class LossTracker:
     def __init__(self, total_samples):
-        self.epoch_losses = []
+        self.per_epoch_sample_losses = {i: [] for i in range(total_samples)}
         self.current_epoch_losses = []
-        self.sample_losses = {i: [] for i in range(total_samples)}
-        
+        self.epoch_losses = []
+        self.total_samples = total_samples
+
     def update_batch(self, losses, sample_indices):
         """Update with per-sample losses"""
         for sample_idx, loss in zip(sample_indices, losses):
-            self.sample_losses[sample_idx].append(loss)
-            self.current_epoch_losses.append(loss)
-    
+            # Only append if we haven't recorded a loss for this sample in the current epoch
+            if len(self.per_epoch_sample_losses[sample_idx]) < len(self.epoch_losses) + 1:
+                self.per_epoch_sample_losses[sample_idx].append(loss)
+            else:
+                # Update the current epoch's loss if we've seen this sample again
+                self.per_epoch_sample_losses[sample_idx][-1] = loss
+
     def update_epoch_loss(self, loss):
         """Update with a single epoch-level loss"""
         self.current_epoch_losses.append(loss)
-    
+
+    def update_from_batch(self, logits, labels, dataset_indices):
+        """Compute per-sample losses and update tracking"""
+        per_sample_loss_fct = torch.nn.CrossEntropyLoss(reduction="none")
+        per_sample_losses = per_sample_loss_fct(
+            logits.view(-1, logits.size(-1)),
+            labels.view(-1)
+        )
+
+        # Update per-sample losses with the current batch
+        self.update_batch(
+            [loss.item() for loss in per_sample_losses],
+            dataset_indices
+        )
+        
+        batch_loss = per_sample_losses.mean().detach().cpu().item()
+        return batch_loss
+
     def finalise_epoch(self):
         """End of epoch"""
         if self.current_epoch_losses:
@@ -25,16 +47,12 @@ class LossTracker:
             self.current_epoch_losses = []
             return epoch_avg_loss
         return None
-    
+
     def get_stats(self):
         """Get loss stats"""
-        average_sample_losses = {
-            idx: np.mean(losses) if losses else 0.0 
-            for idx, losses in self.sample_losses.items()
-        }
         return {
             'epoch_losses': self.epoch_losses,
-            'per_sample_average_losses': average_sample_losses,
+            'per_sample_losses': self.per_epoch_sample_losses,
         }
 
 class ForgettingTracker:
