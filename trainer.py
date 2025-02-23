@@ -47,7 +47,7 @@ class CustomTrainer(Trainer):
                         labels=labels,
                         dataset_indices=dataset_indices,
                     )
-                    self.loss_tracker.update_epoch_loss(batch_loss)
+                    # self.loss_tracker.update_epoch_loss(batch_loss)
 
                 # Update forgetting tracker
                 if self.forgetting_tracker:

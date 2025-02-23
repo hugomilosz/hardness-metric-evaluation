@@ -3,56 +3,48 @@ import numpy as np
 
 class LossTracker:
     def __init__(self, total_samples):
-        self.per_epoch_sample_losses = {i: [] for i in range(total_samples)}
-        self.current_epoch_losses = []
-        self.epoch_losses = []
+        self.losses = []
         self.total_samples = total_samples
-
-    def update_batch(self, losses, sample_indices):
-        """Update with per-sample losses"""
-        for sample_idx, loss in zip(sample_indices, losses):
-            # Only append if we haven't recorded a loss for this sample in the current epoch
-            if len(self.per_epoch_sample_losses[sample_idx]) < len(self.epoch_losses) + 1:
-                self.per_epoch_sample_losses[sample_idx].append(loss)
-            else:
-                # Update the current epoch's loss if we've seen this sample again
-                self.per_epoch_sample_losses[sample_idx][-1] = loss
-
-    def update_epoch_loss(self, loss):
-        """Update with a single epoch-level loss"""
-        self.current_epoch_losses.append(loss)
+        self.current_epoch_losses = []
 
     def update_from_batch(self, logits, labels, dataset_indices):
-        """Compute per-sample losses and update tracking"""
-        per_sample_loss_fct = torch.nn.CrossEntropyLoss(reduction="none")
-        per_sample_losses = per_sample_loss_fct(
-            logits.view(-1, logits.size(-1)),
-            labels.view(-1)
-        )
-
-        # Update per-sample losses with the current batch
-        self.update_batch(
-            [loss.item() for loss in per_sample_losses],
-            dataset_indices
-        )
-        
-        batch_loss = per_sample_losses.mean().detach().cpu().item()
-        return batch_loss
+        """Compute per-sample losses for the current batch"""
+        batch_losses = []
+        for i in range(len(logits)):
+            loss = torch.nn.functional.cross_entropy(
+                logits[i].unsqueeze(0),
+                labels[i].unsqueeze(0),
+                reduction='none'
+            )
+            batch_losses.append(loss.detach().cpu().item())
+            
+        # Store the losses with their indices
+        for idx, loss in zip(dataset_indices, batch_losses):
+            self.current_epoch_losses.append((idx, loss))
+            
+        return np.mean(batch_losses)
 
     def finalise_epoch(self):
-        """End of epoch"""
-        if self.current_epoch_losses:
-            epoch_avg_loss = np.mean(self.current_epoch_losses)
-            self.epoch_losses.append(epoch_avg_loss)
-            self.current_epoch_losses = []
-            return epoch_avg_loss
-        return None
+        """End of epoch - organize losses by sample index"""
+        # Sort losses by sample index
+        sorted_losses = [0] * self.total_samples
+        for idx, loss in self.current_epoch_losses:
+            sorted_losses[idx] = loss
+            
+        self.losses.append(sorted_losses)
+        self.current_epoch_losses = []  # Reset for next epoch
+        
+        return np.mean(sorted_losses)
 
     def get_stats(self):
-        """Get loss stats"""
+        """Get loss stats - losses[epoch][sample_idx]"""
+        epoch_losses = [np.mean(epoch_losses) for epoch_losses in self.losses]
+        # Transpose losses to get per-sample trajectories
+        per_sample_losses = np.array(self.losses).T.tolist()
+        
         return {
-            'epoch_losses': self.epoch_losses,
-            'per_sample_losses': self.per_epoch_sample_losses,
+            'epoch_losses': epoch_losses,
+            'per_sample_losses': {i: losses for i, losses in enumerate(per_sample_losses)}
         }
 
 class ForgettingTracker:
