@@ -7,7 +7,7 @@ class LossTracker:
         self.total_samples = total_samples
         self.current_epoch_losses = []
 
-    def update_from_batch(self, logits, labels, dataset_indices):
+    def update(self, logits, labels, dataset_indices):
         """Compute per-sample losses for the current batch"""
         batch_losses = []
         for i in range(len(logits)):
@@ -79,4 +79,57 @@ class ForgettingTracker:
         return {
             'forgetting_events': self.forgetting_events,
             'forgettable_examples': forgettable_examples,
+        }
+
+import numpy as np
+import torch
+
+class DataMapTracker:
+    def __init__(self, total_samples):
+        """
+        Tracks data maps by storing confidence, variability, and correctness per sample.
+        """
+        self.total_samples = total_samples
+        self.confidence = np.zeros(total_samples)  # Mean confidence of correct predictions
+        self.variability = np.zeros(total_samples)  # Variability in prediction probabilities
+        self.correctness = np.zeros(total_samples)  # Total correct predictions count
+        self.seen_counts = np.zeros(total_samples)  # Number of times a sample has been seen
+
+    def update(self, dataset_indices, logits, labels, probabilities):
+        """
+        Updates the data map statistics for the given batch.
+        """
+        with torch.no_grad():
+            batch_predictions = torch.argmax(logits, dim=-1)
+            batch_correct = (batch_predictions == labels).cpu().numpy()
+            batch_probs = probabilities.cpu().numpy()
+
+            for i, idx in enumerate(dataset_indices):
+                self.seen_counts[idx] += 1
+                self.correctness[idx] += batch_correct[i]
+                
+                # Confidence: Probability of the predicted class
+                predicted_class = batch_predictions[i].item()
+                self.confidence[idx] += batch_probs[i, predicted_class]
+
+                # Variability: Track running variance of probabilities
+                mean_prob = self.confidence[idx] / self.seen_counts[idx]
+                self.variability[idx] += (batch_probs[i, predicted_class] - mean_prob) ** 2
+
+    def finalise_epoch(self):
+        """
+        Computes final statistics after an epoch.
+        """
+        seen_mask = self.seen_counts > 0
+        self.confidence[seen_mask] /= self.seen_counts[seen_mask]  # Normalise confidence
+        self.variability[seen_mask] /= self.seen_counts[seen_mask]  # Normalise variability
+
+    def get_stats(self):
+        """
+        Returns data map statistics: confidence, variability, and correctness.
+        """
+        return {
+            "confidence": self.confidence,
+            "variability": self.variability,
+            "correctness": self.correctness / np.maximum(self.seen_counts, 1),  # Normalise correctness
         }
