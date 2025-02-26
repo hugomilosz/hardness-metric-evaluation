@@ -9,6 +9,10 @@ class LossTracker:
 
     def update_from_batch(self, logits, labels, dataset_indices):
         """Compute per-sample losses for the current batch"""
+        if dataset_indices is None or len(dataset_indices) == 0:
+            print("[ERROR] No dataset indices provided!")
+            return 0  # Return 0 loss to prevent crashes
+
         batch_losses = []
         for i in range(len(logits)):
             loss = torch.nn.functional.cross_entropy(
@@ -17,31 +21,41 @@ class LossTracker:
                 reduction='none'
             )
             batch_losses.append(loss.detach().cpu().item())
-            
-        # Store the losses with their indices
+
+        # Store the losses with their dataset indices
         for idx, loss in zip(dataset_indices, batch_losses):
+            # print(f"[DEBUG] Storing loss for idx {idx}: {loss}")  # Debug print
             self.current_epoch_losses.append((idx, loss))
-            
+
         return np.mean(batch_losses)
 
     def finalise_epoch(self):
         """End of epoch - organize losses by sample index"""
+        if len(self.current_epoch_losses) == 0:
+            print("[WARNING] No losses recorded for this epoch!")
+            return 0  # Return 0 to indicate no losses were stored
+
         # Sort losses by sample index
         sorted_losses = [0] * self.total_samples
         for idx, loss in self.current_epoch_losses:
+            if sorted_losses[idx] != 0:
+                print(f"[WARNING] Duplicate index {idx}, overwriting loss.")
             sorted_losses[idx] = loss
-            
+
         self.losses.append(sorted_losses)
         self.current_epoch_losses = []  # Reset for next epoch
-        
+
         return np.mean(sorted_losses)
 
     def get_stats(self):
         """Get loss stats - losses[epoch][sample_idx]"""
+        if not self.losses:
+            print("[WARNING] No loss data available!")
+            return {'epoch_losses': [], 'per_sample_losses': {}}
+
         epoch_losses = [np.mean(epoch_losses) for epoch_losses in self.losses]
-        # Transpose losses to get per-sample trajectories
         per_sample_losses = np.array(self.losses).T.tolist()
-        
+
         return {
             'epoch_losses': epoch_losses,
             'per_sample_losses': {i: losses for i, losses in enumerate(per_sample_losses)}
