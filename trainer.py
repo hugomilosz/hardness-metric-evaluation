@@ -1,10 +1,11 @@
-import torch
-from transformers import Trainer
 import numpy as np
+import torch
+
 from methods import AumTracker, DataMapTracker, ForgettingTracker, LossTracker
+from transformers import Trainer
 
 class CustomTrainer(Trainer):
-    def __init__(self, *args, methods=None, num_classes=3, **kwargs):
+    def __init__(self, *args, methods=None, num_classes=3, device=None, **kwargs):
         super().__init__(*args, **kwargs)
         self.methods = methods or []
         self.num_classes = num_classes
@@ -17,40 +18,73 @@ class CustomTrainer(Trainer):
         self.loss_tracker = LossTracker(self.total_samples) if "loss" in self.methods else None
 
         self.predictions = []
-        self.true_labels = []
+        self.true_labels = [None] * self.total_samples
 
         # Epoch tracking
         self.current_epoch = 0
-        self.global_step = 0
+        self.device = device
+
+    def get_train_dataloader(self):
+        """
+        Returns the training DataLoader, ensuring dataset indices are included in each batch.
+        """
+        if self.train_dataset is None:
+            raise ValueError("Trainer: training requires a train_dataset.")
+
+        train_sampler = self._get_train_sampler() if not isinstance(self.train_dataset, torch.utils.data.IterableDataset) else None
+
+        def collate_fn(batch):
+            """Custom collate function to extract indices from dataset items."""
+            # for item in batch:
+            #     if isinstance(item['metadata'], list):
+            #         item['metadata'] = torch.tensor(item['metadata'], dtype=torch.long)
+            batch_dict = self.data_collator([{k: v for k, v in item.items() if k != "idx"} for item in batch])
+            batch_indices = [item["idx"] for item in batch]
+            batch_dict['idx'] = batch_indices
+            # print(batch_dict)
+            return batch_dict
+
+        return torch.utils.data.DataLoader(
+            self.train_dataset,
+            batch_size=self.args.train_batch_size,
+            sampler=train_sampler,
+            collate_fn=collate_fn,
+            drop_last=self.args.dataloader_drop_last,
+            num_workers=self.args.dataloader_num_workers,
+            pin_memory=self.args.dataloader_pin_memory,
+        )
+
 
     def training_step(self, model, inputs, num_items_in_batch=None):
-        # print("STEP")
         """Track per-sample losses and predictions during training step"""
+        # print(inputs)
         # Get outputs from parent class
-        loss = super().training_step(model, inputs, num_items_in_batch)
-        
+        dataset_indices = inputs['idx']
+        model_inputs = {key: value.to(self.device) for key, value in inputs.items() if key != 'idx'}
+        loss = super().training_step(model, model_inputs, num_items_in_batch)
+
+        if dataset_indices is not None:
+            # print("here")
+            dataset_indices = [idx.item() for idx in dataset_indices]
+        # print("INDICES: ", dataset_indices)
+
         if self.methods:
             with torch.no_grad():
-                outputs = model(**inputs)
+                outputs = model(**model_inputs)
                 logits = outputs.logits
-                labels = inputs["labels"]
-
-                batch_size = labels.size(0)
-                start_idx = (self.global_step % (self.total_samples // self.args.per_device_train_batch_size)) * self.args.per_device_train_batch_size
-                dataset_indices = [(start_idx + i) % self.total_samples for i in range(batch_size)]
+                labels = model_inputs["labels"]
                 
                 # Track predictions and forgetting
                 predictions = torch.argmax(logits, dim=-1).cpu().numpy()
                 labels_cpu = labels.cpu().numpy()
 
-                # Ensure predictions list has a sublist for current epoch
+                # Update predictions
                 while len(self.predictions) <= self.current_epoch:
-                    self.predictions.append([])
-                    self.true_labels.append([])
-
-                # Store batch predictions for the current epoch
-                self.predictions[self.current_epoch].extend(predictions)
-                self.true_labels[self.current_epoch].extend(labels_cpu)
+                    self.predictions.append([None] * self.total_samples)
+                for i, idx in enumerate(dataset_indices):
+                    self.predictions[self.current_epoch][idx] = predictions[i]
+                    if self.true_labels[idx] is None:
+                        self.true_labels[idx] = labels_cpu[i]
 
                 # Update AUM tracker
                 if self.aum_tracker:
@@ -74,7 +108,6 @@ class CustomTrainer(Trainer):
                     probabilities = torch.nn.functional.softmax(logits, dim=-1)
                     self.data_map_tracker.update(dataset_indices, logits, labels, probabilities)
 
-        self.global_step += 1
         return loss
 
     def evaluate(self, *args, **kwargs):

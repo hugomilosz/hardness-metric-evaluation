@@ -1,74 +1,91 @@
-import torch
 import numpy as np
+import torch
 
 class AumTracker:
-    def __init__(self, num_classes, save_dir=".", compressed=True):
+    def __init__(self, num_classes):
         """
-        A tracker for the AUM (Area Under the Margin) score.
-
+        A tracker for the Area Under the Margin (AUM) score.
+        
         Args:
-          num_classes (int): The number of classes in the classification task.
-          save_dir (str): Directory to save intermediate results (if needed).
-          compressed (bool): Whether to use compressed format for saving results.
+            num_classes (int): The number of classes in the classification task.
         """
         self.num_classes = num_classes
-        self.save_dir = save_dir
-        self.compressed = compressed
-        self.margins = []
-        self.scores = []
-
-    def update(self, y_pred, y_true, sample_ids):
+        self.sample_margins = {}
+        self.epoch_margins = {}
+        self.current_epoch = 0
+        
+    def update(self, logits, labels, sample_ids):
         """
         Update the AUM scores based on model predictions and true labels.
         
         Args:
-          y_pred (torch.Tensor): Model predictions (logits).
-          y_true (torch.Tensor): True labels for the batch.
-          sample_ids (torch.Tensor): Unique sample IDs for the batch.
+            logits (torch.Tensor): Model predictions (logits, pre-softmax outputs).
+            labels (torch.Tensor): True labels for the batch.
+            sample_ids (list): Unique sample IDs for the batch.
         """
-        # Compute the margin for each sample (difference between correct class score and others)
-        logits = y_pred  # Predicted logits
-        true_class_logits = logits.gather(1, y_true.view(-1, 1))  # Get the logits for the true class
-        margins = logits - true_class_logits  # Margins for each class
-        
-        # We need to calculate the area under the margin for each sample.
-        for i in range(margins.shape[0]):
-            sample_margin = margins[i, :].cpu().numpy()  # Convert margin to numpy
-            self.margins.append(sample_margin)
-        
+        with torch.no_grad():
+            logits_np = logits.detach().cpu().numpy()
+            labels_np = labels.detach().cpu().numpy()
+            
+            for i, sample_id in enumerate(sample_ids):
+                # Get logits, true label and class logit
+                sample_logits = logits_np[i]
+                assigned_class = labels_np[i]
+                assigned_logit = sample_logits[assigned_class]
+
+                other_logits = np.delete(sample_logits, assigned_class)
+                largest_other_logit = np.max(other_logits)
+                margin = assigned_logit - largest_other_logit
+                self.epoch_margins[sample_id] = margin
+    
     def finalise_epoch(self):
         """
-        Finalise the AUM calculation.
+        Finalise the AUM calculation for the current epoch and prepare for the next.
         """
-        all_margins = np.array(self.margins)
-        aum_scores = np.mean(all_margins, axis=1)
-        self.scores.append(aum_scores.tolist())
-        self.margins = []
-
+        # Transfer epoch margins to cumulative tracking
+        for sample_id, margin in self.epoch_margins.items():
+            if sample_id not in self.sample_margins:
+                self.sample_margins[sample_id] = []
+            self.sample_margins[sample_id].append(margin)
+        
+        # Clear epoch margins for next epoch
+        self.epoch_margins = {}
+        self.current_epoch += 1
+    
     def get_stats(self):
         """
-        Return AUM statistics.
+        Calculate and return AUM statistics for all samples across all epochs.
+        
+        Returns:
+            dict: Dictionary with sample IDs and their AUM scores
         """
-        return {"aum_scores": self.scores}
+        aum_scores = {}
+        for sample_id, margins in self.sample_margins.items():
+            # AUM is the average margin over all epochs
+            aum_scores[sample_id] = sum(margins) / len(margins)
+        
+        return {
+            "aum_scores": aum_scores,
+            "sample_margins": self.sample_margins
+        }
 
 class DataMapTracker:
     def __init__(self, total_samples):
         """
         Tracks data maps by storing confidence, variability, and correctness per sample across epochs.
-        
         Args:
             total_samples: The total number of samples in the dataset
         """
         self.total_samples = total_samples
         self.gold_label_probs = None  # Will store gold label probabilities (samples, epochs)
         self.epoch_gold_probs = np.full(total_samples, np.nan)  # Current epoch's gold label probs
+        self.epoch_sum_probs = np.zeros(total_samples)  # Sum of probs for averaging
         self.seen_counts = np.zeros(total_samples)  # Track samples seen in current epoch
         self.current_epoch = 0
     
     def update(self, dataset_indices, logits, labels, probabilities):
         """
         Updates the data map statistics for the given batch.
-        
         Args:
             dataset_indices: Indices of samples in the dataset
             logits: Model logits
@@ -80,21 +97,24 @@ class DataMapTracker:
             batch_labels = labels.cpu().numpy()
             
             for i, idx in enumerate(dataset_indices):
-                self.seen_counts[idx] += 1
-                
                 # Get probability assigned to the gold/correct class
                 gold_class = batch_labels[i]
                 gold_prob = batch_probs[i, gold_class]
                 
-                # Store the gold probability directly
-                self.epoch_gold_probs[idx] = gold_prob
+                # Accumulate probabilities for averaging at end of epoch
+                self.epoch_sum_probs[idx] += gold_prob
+                self.seen_counts[idx] += 1
     
     def finalise_epoch(self):
         """
         Finalises stats for the current epoch
         """
-        # Only consider samples that were seen (not NaN)
-        seen_mask = ~np.isnan(self.epoch_gold_probs)
+        # Calculate average gold probability for this epoch
+        seen_mask = self.seen_counts > 0
+        
+        # Divide sum by count to get average probability
+        self.epoch_gold_probs[:] = np.nan  # Default for unseen samples
+        self.epoch_gold_probs[seen_mask] = self.epoch_sum_probs[seen_mask] / self.seen_counts[seen_mask]
         
         # Store this epoch's probabilities
         if self.gold_label_probs is None:
@@ -109,6 +129,7 @@ class DataMapTracker:
         
         # Reset for next epoch
         self.epoch_gold_probs[:] = np.nan
+        self.epoch_sum_probs[:] = 0
         self.seen_counts[:] = 0
         self.current_epoch += 1
     
@@ -140,7 +161,6 @@ class DataMapTracker:
         """
         if self.gold_label_probs is None:
             return np.array([])
-        # Using 0.5 as threshold for correctness, same as reference implementation
         return np.nanmean(self.gold_label_probs > 0.5, axis=1)
     
     def get_stats(self):
@@ -150,15 +170,10 @@ class DataMapTracker:
         if self.gold_label_probs is None or self.gold_label_probs.shape[1] == 0:
             return {"confidence": [], "variability": [], "correctness": []}
         
-        # Calculate metrics across epochs
-        confidence = np.nanmean(self.gold_label_probs, axis=1)  # Average confidence
-        variability = np.nanstd(self.gold_label_probs, axis=1)  # Standard deviation across epochs
-        correctness = np.nanmean(self.gold_label_probs > 0.5, axis=1)  # Proportion correct
-        
         return {
-            "confidence": confidence,
-            "variability": variability,
-            "correctness": correctness
+            "confidence": self.confidence,
+            "variability": self.variability,
+            "correctness": self.correctness
         }
 
 class ForgettingTracker:
@@ -199,7 +214,8 @@ class LossTracker:
     def __init__(self, total_samples):
         self.losses = []
         self.total_samples = total_samples
-        self.current_epoch_losses = []
+        self.current_epoch_losses_sum = {}
+        self.current_epoch_counts = {}
 
     def update(self, logits, labels, dataset_indices):
         """Compute per-sample losses for the current batch"""
@@ -212,23 +228,35 @@ class LossTracker:
             )
             batch_losses.append(loss.detach().cpu().item())
             
-        # Store the losses with their indices
+        # Store the losses with their indices, accumulating for duplicates
         for idx, loss in zip(dataset_indices, batch_losses):
-            self.current_epoch_losses.append((idx, loss))
+            if idx not in self.current_epoch_losses_sum:
+                self.current_epoch_losses_sum[idx] = loss
+                self.current_epoch_counts[idx] = 1
+            else:
+                self.current_epoch_losses_sum[idx] += loss
+                self.current_epoch_counts[idx] += 1
             
         return np.mean(batch_losses)
 
     def finalise_epoch(self):
-        """End of epoch - organize losses by sample index"""
+        """End of epoch - organise losses by sample index"""
         # Sort losses by sample index
-        sorted_losses = [0.0] * self.total_samples
-        for idx, loss in self.current_epoch_losses:
-            sorted_losses[idx] = loss
+        sorted_losses = [float('nan')] * self.total_samples
+        for idx in self.current_epoch_losses_sum:
+            avg_loss = self.current_epoch_losses_sum[idx] / self.current_epoch_counts[idx]
+            sorted_losses[idx] = avg_loss
             
         self.losses.append(sorted_losses)
-        self.current_epoch_losses = []  # Reset for next epoch
+
+        self.current_epoch_losses_sum = {}
+        self.current_epoch_counts = {}
         
-        return np.mean(sorted_losses)
+        # Calculate epoch mean (ignoring NaN values)
+        valid_losses = [loss for loss in sorted_losses if not np.isnan(loss)]
+        epoch_mean = np.mean(valid_losses) if valid_losses else float('nan')
+        
+        return epoch_mean
 
     def get_stats(self):
         """Get loss stats - losses[epoch][sample_idx]"""
