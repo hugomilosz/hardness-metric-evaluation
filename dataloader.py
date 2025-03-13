@@ -59,7 +59,7 @@ class DataLoader:
                 examples["premise"],
                 examples["hypothesis"],
                 truncation=True,
-                max_length=128,
+                max_length=512,
                 padding="max_length"
             )
             tokenized["labels"] = examples["label"]  # MultiNLI uses "label"
