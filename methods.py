@@ -182,18 +182,23 @@ class EL2NTracker:
         self.total_samples = total_samples
         self.el2n_scores = []
         self.current_epoch_scores = np.full(self.total_samples, np.nan)
-        self.current_epoch_indices = []
 
     def update(self, dataset_indices, probabilities, labels):
         with torch.no_grad():
             batch_probs = probabilities.cpu().numpy()
             batch_labels = labels.cpu().numpy()
-            one_hot_labels = np.eye(batch_probs.shape[1])[batch_labels]  # One-hot encoding of labels
-            batch_scores = np.linalg.norm(batch_probs - one_hot_labels, axis=1)  # L2 norm (EL2N)
+            num_classes = batch_probs.shape[1]
 
-            # Store the scores with their indices for the current epoch
-            self.current_epoch_scores[dataset_indices] = batch_scores
-            self.current_epoch_indices.extend(dataset_indices)
+            # Ensure one-hot encoding is done correctly
+            one_hot_labels = np.zeros_like(batch_probs)
+            one_hot_labels[np.arange(batch_labels.size), batch_labels] = 1  
+
+            # Compute EL2N score: L2 norm between probabilities and true one-hot labels
+            batch_scores = np.linalg.norm(batch_probs - one_hot_labels, ord=2, axis=1)
+
+            # Store the scores
+            for i, idx in enumerate(dataset_indices):
+                self.current_epoch_scores[idx] = batch_scores[i]
 
     def finalise_epoch(self):
         # Append the current epoch's EL2N scores
@@ -201,51 +206,47 @@ class EL2NTracker:
 
         # Reset for the next epoch
         self.current_epoch_scores = np.full(self.total_samples, np.nan)
-        self.current_epoch_indices = []
 
     def get_scores(self):
         return np.array(self.el2n_scores)
-
 
 class GrandTracker:
     def __init__(self, total_samples):
         self.total_samples = total_samples
         self.grand_scores = []
         self.current_epoch_scores = np.full(self.total_samples, np.nan)
-        self.current_epoch_indices = []
 
     def update(self, dataset_indices, logits, labels, model):
         """ Update GraNd scores only for the classifier layer on top of PLM. """
-        logits.requires_grad_(True)
-        params = list(model.classifier.parameters())
-        
+        # Clone logits to avoid in-place modification
+        logits = logits.clone().detach().requires_grad_(True)  # Ensure logits are tracked for gradients
+        params = list(model.classifier.parameters())  # Get classifier layer
+
         batch_scores = []
-        # Loop through the batch
-        for i in range(logits.size(0)):
+        for i in range(logits.size(0)):  # Iterate over batch
+            # Compute the loss for each sample in the batch
             loss = torch.nn.functional.cross_entropy(logits[i].unsqueeze(0), labels[i].unsqueeze(0), reduction='sum')
-        
-            # Compute gradients w.r.t the classifier layer
-            gradients = torch.autograd.grad(outputs=loss, inputs=params, create_graph=False, retain_graph=True)
-            grad_norms = torch.cat([g.view(-1) for g in gradients if g is not None], dim=0)
-            
+
+            # Compute gradients w.r.t classifier layer
+            gradients = torch.autograd.grad(outputs=loss, inputs=params, create_graph=False, retain_graph=True, allow_unused=True)
+
             # Compute L2 norm of gradients
+            grad_norms = torch.cat([g.view(-1) for g in gradients if g is not None], dim=0)
             grand_score = torch.norm(grad_norms, p=2).item()
             batch_scores.append(grand_score)
 
-        self.current_epoch_scores[dataset_indices] = np.array(batch_scores)
-        self.current_epoch_indices.extend(dataset_indices)
-
+        # Update current epoch scores
+        for i, idx in enumerate(dataset_indices):
+            self.current_epoch_scores[idx] = batch_scores[i]
 
     def finalise_epoch(self):
-        # Append the epoch's GraNd scores
+        # Append the epoch's GraNd scores and reset
         self.grand_scores.append(self.current_epoch_scores.copy())
-        
-        # Reset for the next epoch
         self.current_epoch_scores = np.full(self.total_samples, np.nan)
-        self.current_epoch_indices = []
 
     def get_scores(self):
         return np.array(self.grand_scores)
+
 
 class ForgettingTracker:
     def __init__(self, total_samples):
