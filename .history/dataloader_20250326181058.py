@@ -47,6 +47,7 @@ class DataLoader:
         self.dataset_name = dataset_name
         self.model_name = model_name
         self.tokenizer = AutoTokenizer.from_pretrained(model_name)
+<<<<<<< HEAD
 
     def preprocess_function(self, examples, indices=None):
         tokenized = self.tokenizer(
@@ -84,6 +85,8 @@ class DataLoader:
         )
         
         tokenized_datasets.set_format("torch")
+=======
+>>>>>>> origin
         
     def preprocess_function(self, examples, indices):
         """

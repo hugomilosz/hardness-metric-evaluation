@@ -1,6 +1,7 @@
 import numpy as np
 import torch
 
+<<<<<<< HEAD
 class LossTracker:
     def __init__(self, total_samples):
         self.losses = []
@@ -46,6 +47,39 @@ class LossTracker:
         self.current_epoch_losses = []  # Reset for next epoch
 
         return np.mean(sorted_losses)
+=======
+class AumTracker:
+    def __init__(self, num_classes):
+        """
+        A tracker for the Area Under the Margin (AUM) score.
+        
+        Args:
+            num_classes (int): The number of classes in the classification task.
+        """
+        self.num_classes = num_classes
+        self.sample_margins = {}
+        self.epoch_margins = {}
+        self.current_epoch = 0
+        
+    def update(self, logits, labels, sample_ids):
+        """
+        Update the AUM scores based on model predictions and true labels.
+        
+        Args:
+            logits (torch.Tensor): Model predictions (logits, pre-softmax outputs).
+            labels (torch.Tensor): True labels for the batch.
+            sample_ids (list): Unique sample IDs for the batch.
+        """
+        with torch.no_grad():
+            logits_np = logits.detach().cpu().numpy()
+            labels_np = labels.detach().cpu().numpy()
+            
+            for i, sample_id in enumerate(sample_ids):
+                # Get logits, true label and class logit
+                sample_logits = logits_np[i]
+                assigned_class = labels_np[i]
+                assigned_logit = sample_logits[assigned_class]
+>>>>>>> origin
 
                 other_logits = np.delete(sample_logits, assigned_class)
                 largest_other_logit = np.max(other_logits)
@@ -67,6 +101,7 @@ class LossTracker:
         self.current_epoch += 1
     
     def get_stats(self):
+<<<<<<< HEAD
         """Get loss stats - losses[epoch][sample_idx]"""
         if not self.losses:
             print("[WARNING] No loss data available!")
@@ -75,6 +110,19 @@ class LossTracker:
         epoch_losses = [np.mean(epoch_losses) for epoch_losses in self.losses]
         per_sample_losses = np.array(self.losses).T.tolist()
 
+=======
+        """
+        Calculate and return AUM statistics for all samples across all epochs.
+        
+        Returns:
+            dict: Dictionary with sample IDs and their AUM scores
+        """
+        aum_scores = {}
+        for sample_id, margins in self.sample_margins.items():
+            # AUM is the average margin over all epochs
+            aum_scores[sample_id] = sum(margins) / len(margins)
+        
+>>>>>>> origin
         return {
             "aum_scores": aum_scores,
             "sample_margins": self.sample_margins
