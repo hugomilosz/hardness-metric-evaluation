@@ -1,51 +1,38 @@
 import numpy as np
 import torch
+import torch.nn.functional as F
 
-class LossTracker:
-    def __init__(self, total_samples):
-        self.losses = []
-        self.total_samples = total_samples
-        self.current_epoch_losses = []
-
-    def update_from_batch(self, logits, labels, dataset_indices):
-        """Compute per-sample losses for the current batch"""
-        if dataset_indices is None or len(dataset_indices) == 0:
-            print("[ERROR] No dataset indices provided!")
-            return 0  # Return 0 loss to prevent crashes
-
-        batch_losses = []
-        for i in range(len(logits)):
-            loss = torch.nn.functional.cross_entropy(
-                logits[i].unsqueeze(0),
-                labels[i].unsqueeze(0),
-                reduction='none'
-            )
-            batch_losses.append(loss.detach().cpu().item())
-
-        # Store the losses with their dataset indices
-        for idx, loss in zip(dataset_indices, batch_losses):
-            # print(f"[DEBUG] Storing loss for idx {idx}: {loss}")  # Debug print
-            self.current_epoch_losses.append((idx, loss))
-
-        return np.mean(batch_losses)
-
-    def finalise_epoch(self):
-        """End of epoch - organize losses by sample index"""
-        if len(self.current_epoch_losses) == 0:
-            print("[WARNING] No losses recorded for this epoch!")
-            return 0  # Return 0 to indicate no losses were stored
-
-        # Sort losses by sample index
-        sorted_losses = [0] * self.total_samples
-        for idx, loss in self.current_epoch_losses:
-            if sorted_losses[idx] != 0:
-                print(f"[WARNING] Duplicate index {idx}, overwriting loss.")
-            sorted_losses[idx] = loss
-
-        self.losses.append(sorted_losses)
-        self.current_epoch_losses = []  # Reset for next epoch
-
-        return np.mean(sorted_losses)
+class AumTracker:
+    def __init__(self, num_classes):
+        """
+        A tracker for the Area Under the Margin (AUM) score.
+        
+        Args:
+            num_classes (int): The number of classes in the classification task.
+        """
+        self.num_classes = num_classes
+        self.sample_margins = {}
+        self.epoch_margins = {}
+        self.current_epoch = 0
+        
+    def update(self, logits, labels, sample_ids):
+        """
+        Update the AUM scores based on model predictions and true labels.
+        
+        Args:
+            logits (torch.Tensor): Model predictions (logits, pre-softmax outputs).
+            labels (torch.Tensor): True labels for the batch.
+            sample_ids (list): Unique sample IDs for the batch.
+        """
+        with torch.no_grad():
+            logits_np = logits.detach().cpu().numpy()
+            labels_np = labels.detach().cpu().numpy()
+            
+            for i, sample_id in enumerate(sample_ids):
+                # Get logits, true label and class logit
+                sample_logits = logits_np[i]
+                assigned_class = labels_np[i]
+                assigned_logit = sample_logits[assigned_class]
 
                 other_logits = np.delete(sample_logits, assigned_class)
                 largest_other_logit = np.max(other_logits)
@@ -67,14 +54,17 @@ class LossTracker:
         self.current_epoch += 1
     
     def get_stats(self):
-        """Get loss stats - losses[epoch][sample_idx]"""
-        if not self.losses:
-            print("[WARNING] No loss data available!")
-            return {'epoch_losses': [], 'per_sample_losses': {}}
-
-        epoch_losses = [np.mean(epoch_losses) for epoch_losses in self.losses]
-        per_sample_losses = np.array(self.losses).T.tolist()
-
+        """
+        Calculate and return AUM statistics for all samples across all epochs.
+        
+        Returns:
+            dict: Dictionary with sample IDs and their AUM scores
+        """
+        aum_scores = {}
+        for sample_id, margins in self.sample_margins.items():
+            # AUM is the average margin over all epochs
+            aum_scores[sample_id] = sum(margins) / len(margins)
+        
         return {
             "aum_scores": aum_scores,
             "sample_margins": self.sample_margins
@@ -124,7 +114,7 @@ class DataMapTracker:
         seen_mask = self.seen_counts > 0
         
         # Divide sum by count to get average probability
-        self.epoch_gold_probs[:] = np.nan  # Default for unseen samples
+        self.epoch_gold_probs[:] = np.nan
         self.epoch_gold_probs[seen_mask] = self.epoch_sum_probs[seen_mask] / self.seen_counts[seen_mask]
         
         # Store this epoch's probabilities
@@ -187,6 +177,76 @@ class DataMapTracker:
             "correctness": self.correctness
         }
 
+class EL2NTracker:
+    def __init__(self, total_samples):
+        self.total_samples = total_samples
+        self.el2n_scores = []
+        self.current_epoch_scores = np.full(self.total_samples, np.nan)
+        self.current_epoch_indices = []
+
+    def update(self, dataset_indices, probabilities, labels):
+        with torch.no_grad():
+            batch_probs = probabilities.cpu().numpy()
+            batch_labels = labels.cpu().numpy()
+            one_hot_labels = np.eye(batch_probs.shape[1])[batch_labels]  # One-hot encoding of labels
+            batch_scores = np.linalg.norm(batch_probs - one_hot_labels, axis=1)  # L2 norm (EL2N)
+
+            # Store the scores with their indices for the current epoch
+            self.current_epoch_scores[dataset_indices] = batch_scores
+            self.current_epoch_indices.extend(dataset_indices)
+
+    def finalise_epoch(self):
+        # Append the current epoch's EL2N scores
+        self.el2n_scores.append(self.current_epoch_scores.copy())
+
+        # Reset for the next epoch
+        self.current_epoch_scores = np.full(self.total_samples, np.nan)
+        self.current_epoch_indices = []
+
+    def get_scores(self):
+        return np.array(self.el2n_scores)
+
+
+class GrandTracker:
+    def __init__(self, total_samples):
+        self.total_samples = total_samples
+        self.grand_scores = []
+        self.current_epoch_scores = np.full(self.total_samples, np.nan)
+        self.current_epoch_indices = []
+
+    def update(self, dataset_indices, logits, labels, model):
+        """ Update GraNd scores only for the classifier layer on top of PLM. """
+        logits.requires_grad_(True)
+        params = list(model.classifier.parameters())
+        
+        batch_scores = []
+        # Loop through the batch
+        for i in range(logits.size(0)):
+            loss = torch.nn.functional.cross_entropy(logits[i].unsqueeze(0), labels[i].unsqueeze(0), reduction='sum')
+        
+            # Compute gradients w.r.t the classifier layer
+            gradients = torch.autograd.grad(outputs=loss, inputs=params, create_graph=False, retain_graph=True)
+            grad_norms = torch.cat([g.view(-1) for g in gradients if g is not None], dim=0)
+            
+            # Compute L2 norm of gradients
+            grand_score = torch.norm(grad_norms, p=2).item()
+            batch_scores.append(grand_score)
+
+        self.current_epoch_scores[dataset_indices] = np.array(batch_scores)
+        self.current_epoch_indices.extend(dataset_indices)
+
+
+    def finalise_epoch(self):
+        # Append the epoch's GraNd scores
+        self.grand_scores.append(self.current_epoch_scores.copy())
+        
+        # Reset for the next epoch
+        self.current_epoch_scores = np.full(self.total_samples, np.nan)
+        self.current_epoch_indices = []
+
+    def get_scores(self):
+        return np.array(self.grand_scores)
+
 class ForgettingTracker:
     def __init__(self, total_samples):
         self.last_correct = {i: False for i in range(total_samples)}
@@ -231,50 +291,34 @@ class LossTracker:
     def update(self, logits, labels, dataset_indices):
         """Compute per-sample losses for the current batch"""
         batch_losses = []
+        labels = labels.to(logits.device)
         for i in range(len(logits)):
             loss = torch.nn.functional.cross_entropy(
                 logits[i].unsqueeze(0),
                 labels[i].unsqueeze(0),
-                reduction='none'
+                reduction='sum'
             )
             batch_losses.append(loss.detach().cpu().item())
             
-        # Store the losses with their indices, accumulating for duplicates
+        # Store losses with their indices, accumulating for duplicates
         for idx, loss in zip(dataset_indices, batch_losses):
             if idx not in self.current_epoch_losses_sum:
-                self.current_epoch_losses_sum[idx] = loss
-                self.current_epoch_counts[idx] = 1
-            else:
-                self.current_epoch_losses_sum[idx] += loss
-                self.current_epoch_counts[idx] += 1
-            
-        return np.mean(batch_losses)
+                self.current_epoch_losses_sum[idx] = []
+            self.current_epoch_losses_sum[idx].append(loss)
 
     def finalise_epoch(self):
         """End of epoch - organise losses by sample index"""
-        # Sort losses by sample index
-        sorted_losses = [float('nan')] * self.total_samples
-        for idx in self.current_epoch_losses_sum:
-            avg_loss = self.current_epoch_losses_sum[idx] / self.current_epoch_counts[idx]
-            sorted_losses[idx] = avg_loss
-            
-        self.losses.append(sorted_losses)
+        sorted_losses = [np.nan] * self.total_samples
+        for idx, losses in self.current_epoch_losses_sum.items():
+            sorted_losses[idx] = np.mean(losses)
 
+        self.losses.append(sorted_losses)
         self.current_epoch_losses_sum = {}
-        self.current_epoch_counts = {}
-        
-        # Calculate epoch mean (ignoring NaN values)
-        valid_losses = [loss for loss in sorted_losses if not np.isnan(loss)]
-        epoch_mean = np.mean(valid_losses) if valid_losses else float('nan')
-        
-        return epoch_mean
 
     def get_stats(self):
         """Get loss stats - losses[epoch][sample_idx]"""
         epoch_losses = [np.nanmean(epoch_losses) for epoch_losses in self.losses]
-        # Transpose losses to get per-sample trajectories
         per_sample_losses = np.array(self.losses).T.tolist()
-        
         return {
             'epoch_losses': epoch_losses,
             'per_sample_losses': {i: losses for i, losses in enumerate(per_sample_losses)},
