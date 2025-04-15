@@ -154,7 +154,7 @@ class IndependentTrainer:
         self.device = device
         self.args = args
         
-        # Initialize trackers
+        # Initialise trackers
         self.aum_tracker = AumTracker(self.num_classes) if "aum" in self.methods else None
         self.data_map_tracker = DataMapTracker(self.total_samples) if "datamaps" in self.methods else None
         self.el2n_tracker = EL2NTracker(self.total_samples) if "el2n" in self.methods else None

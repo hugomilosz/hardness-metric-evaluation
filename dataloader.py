@@ -4,7 +4,6 @@ from torch.utils.data import Dataset
 from transformers import AutoTokenizer
 from wilds import get_dataset
 
-
 class CustomWILDSDataset(Dataset):
     """Custom wrapper for WILDS dataset to make it compatible with CustomTrainer"""
     
@@ -53,7 +52,9 @@ class DataLoader:
     
     SUPPORTED_DATASETS = {
         "multi_nli": {"num_labels": 3},
-        "civilcomments_wilds": {"num_labels": 2}
+        "civilcomments_wilds": {"num_labels": 2},
+        "fever": {"num_labels": 3},  # SUPPORTED, REFUTED, NOT ENOUGH INFO
+        "qqp": {"num_labels": 2},    # Duplicate or not
     }
     
     def __init__(self, dataset_name, model_name):
@@ -93,7 +94,7 @@ class DataLoader:
         return (
             tokenized_datasets["train"],
             tokenized_datasets["validation_matched"],
-            self.SUPPORTED_DATASETS["multi_nli"]["num_labels"]
+            self.SUPPORTED_DATASETS["multi_nli"]["num_labels"],
         )
     
     def load_civilcomments_wilds(self):
@@ -110,12 +111,37 @@ class DataLoader:
             eval_dataset,
             self.SUPPORTED_DATASETS["civilcomments_wilds"]["num_labels"]
         )
-        
+
+    def get_model(self, model_name, num_labels):
+        model_paths = {
+            'bert-tiny': 'prajjwal1/bert-tiny',
+            'bert-base': 'bert-base-uncased',
+            'bert-large': 'bert-large-uncased',
+            'roberta-base': 'roberta-base',
+            'roberta-large': 'roberta-large',
+            'xlnet-base': 'xlnet-base-cased',
+            'xlnet-large': 'xlnet-large-cased'
+        }
+
+        if model_name not in model_paths:
+            raise ValueError(f"Model {model_name} not supported. Available options: {list(model_paths.keys())}")
+
+        model = AutoModelForSequenceClassification.from_pretrained(
+            model_paths[model_name],
+            num_labels=num_labels
+        )
+        return model
+
+    
     def prepare_datasets(self):
         """Load and prepare datasets based on the specified dataset name"""
         if self.dataset_name == "multi_nli":
             train_dataset, eval_dataset, num_labels = self.load_multi_nli()
         elif self.dataset_name == "civilcomments_wilds":
             train_dataset, eval_dataset, num_labels = self.load_civilcomments_wilds()
+        # elif self.dataset_name == "fever":
+        # elif self.dataset_name == "qqp":
+
+        model = self.get_model(self.model_name, num_labels)
             
-        return train_dataset, eval_dataset, self.tokenizer, num_labels
+        return train_dataset, eval_dataset, self.tokenizer, num_labels, model
