@@ -1,7 +1,7 @@
 from datasets import load_dataset
 import torch
 from torch.utils.data import Dataset
-from transformers import AutoTokenizer
+from transformers import AutoTokenizer, AutoModelForSequenceClassification
 from wilds import get_dataset
 
 class CustomWILDSDataset(Dataset):
@@ -56,14 +56,24 @@ class DataLoader:
         "fever": {"num_labels": 3},  # SUPPORTED, REFUTED, NOT ENOUGH INFO
         "qqp": {"num_labels": 2},    # Duplicate or not
     }
-    
+
+    model_paths = {
+        'bert-tiny': 'prajjwal1/bert-tiny',
+        'bert-base': 'bert-base-uncased',
+        'bert-large': 'bert-large-uncased',
+        'roberta-base': 'roberta-base',
+        'roberta-large': 'roberta-large',
+        'xlnet-base': 'xlnet-base-cased',
+        'xlnet-large': 'xlnet-large-cased'
+    }
+
     def __init__(self, dataset_name, model_name):
         if dataset_name not in self.SUPPORTED_DATASETS:
             raise ValueError(f"Dataset {dataset_name} not supported. Available options: {list(self.SUPPORTED_DATASETS.keys())}")
         
         self.dataset_name = dataset_name
         self.model_name = model_name
-        self.tokenizer = AutoTokenizer.from_pretrained(model_name)
+        self.tokenizer = AutoTokenizer.from_pretrained(self.model_paths[model_name])
         
     def preprocess_multi_nli(self, examples, indices):
         """Tokenizes MultiNLI dataset examples"""
@@ -112,6 +122,39 @@ class DataLoader:
             self.SUPPORTED_DATASETS["civilcomments_wilds"]["num_labels"]
         )
 
+    def preprocess_qqp(self, examples, indices):
+        """Tokenizes QQP dataset examples"""
+        tokenized = self.tokenizer(
+            examples["question1"],
+            examples["question2"],
+            truncation=True,
+            max_length=256,
+            padding="max_length"
+        )
+        tokenized["labels"] = examples["label"]
+        tokenized["idx"] = indices
+        return tokenized
+
+    def load_qqp(self):
+        """Load and process QQP dataset from GLUE benchmark"""
+        dataset = load_dataset("glue", "qqp")
+        dataset = dataset.map(lambda example, idx: {"idx": idx}, with_indices=True)
+
+        tokenized_datasets = dataset.map(
+            self.preprocess_qqp,
+            batched=True,
+            with_indices=True,
+            remove_columns=dataset["train"].column_names,
+        )
+        tokenized_datasets.set_format("torch")
+
+        return (
+            tokenized_datasets["train"],
+            tokenized_datasets["validation"],
+            self.SUPPORTED_DATASETS["qqp"]["num_labels"]
+        )
+
+
     def get_model(self, model_name, num_labels):
         model_paths = {
             'bert-tiny': 'prajjwal1/bert-tiny',
@@ -140,7 +183,9 @@ class DataLoader:
         elif self.dataset_name == "civilcomments_wilds":
             train_dataset, eval_dataset, num_labels = self.load_civilcomments_wilds()
         # elif self.dataset_name == "fever":
-        # elif self.dataset_name == "qqp":
+        #     train_dataset, eval_dataset, num_labels = self.load_fever()
+        elif self.dataset_name == "qqp":
+            train_dataset, eval_dataset, num_labels = self.load_qqp()
 
         model = self.get_model(self.model_name, num_labels)
             

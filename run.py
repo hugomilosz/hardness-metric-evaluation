@@ -74,7 +74,7 @@ def compute_metrics(eval_pred):
 def main():
     args = parse_args()
 
-    elif args.wandb_config:
+    if args.wandb_config:
         with open(args.wandb_config, "r") as f:
             wandb_creds = yaml.load(f, Loader=yaml.FullLoader)
         os.environ["WANDB_API_KEY"] = wandb_creds["wandb_key"]
