@@ -70,6 +70,18 @@ def compute_metrics(eval_pred):
     predictions = np.argmax(predictions, axis=1)
     return metric.compute(predictions=predictions, references=labels)
 
+def binarise_scores(method, scores):
+    """Given an array of scores per example, return a binary 0/1 array for easy/hard."""
+    if method == "forgetting":
+        return [1 if v > 0 else 0 for v in scores]
+    
+    median = np.median(scores)
+    if method in ["el2n", "loss", "grand"]:
+        return [1 if v >= median else 0 for v in scores]
+    elif method in ["aum", "datamaps"]:
+        return [1 if v <= median else 0 for v in scores]
+    else:
+        raise ValueError(f"Unsupported method: {method}")
 
 def main():
     args = parse_args()
@@ -132,6 +144,14 @@ def main():
         device=device
     )
     trainer.train(args.epochs)
+
+    stats = trainer.get_unified_stats()
+
+    for method, method_stats in stats.items():
+        epochs = len(method_stats)
+        for epoch_idx in range(epochs):
+            epoch_scores = method_stats[epoch_idx]
+            binary_labels = binarise_scores(method, epoch_scores)
 
     wandb.finish()
 
