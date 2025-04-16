@@ -7,6 +7,7 @@ import yaml
 
 from evaluate import load
 from dataloader import DataLoader
+from evaluator import Evaluator
 from trainer import IndependentTrainer
 from transformers import (
     AutoModelForSequenceClassification,
@@ -145,13 +146,9 @@ def main():
     )
     trainer.train(args.epochs)
 
+    # Evaluate stats
     stats = trainer.get_unified_stats()
-
-    for method, method_stats in stats.items():
-        epochs = len(method_stats)
-        for epoch_idx in range(epochs):
-            epoch_scores = method_stats[epoch_idx]
-            binary_labels = binarise_scores(method, epoch_scores)
+    # eval_dict = Evaluator(len(train_dataset), stats)
 
     wandb.finish()
 
