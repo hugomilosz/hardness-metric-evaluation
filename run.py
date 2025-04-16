@@ -38,7 +38,7 @@ AVAILABLE_MODELS = [
 AVAILABLE_DATASETS = [
     "multi_nli",
     "civil-comments-wilds",
-    "fever",
+    # "fever",
     "qqp",
 ]
 
@@ -70,19 +70,6 @@ def compute_metrics(eval_pred):
     predictions, labels = eval_pred
     predictions = np.argmax(predictions, axis=1)
     return metric.compute(predictions=predictions, references=labels)
-
-def binarise_scores(method, scores):
-    """Given an array of scores per example, return a binary 0/1 array for easy/hard."""
-    if method == "forgetting":
-        return [1 if v > 0 else 0 for v in scores]
-    
-    median = np.median(scores)
-    if method in ["el2n", "loss", "grand"]:
-        return [1 if v >= median else 0 for v in scores]
-    elif method in ["aum", "datamaps"]:
-        return [1 if v <= median else 0 for v in scores]
-    else:
-        raise ValueError(f"Unsupported method: {method}")
 
 def main():
     args = parse_args()

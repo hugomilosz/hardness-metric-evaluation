@@ -7,7 +7,7 @@ from tqdm import tqdm
 
 from methods import AumTracker, DataMapTracker, EL2NTracker, ForgettingTracker, GrandTracker, LossTracker
 
-class IndependentTrainer:
+class Trainer:
     def __init__(self, model, train_dataset, eval_dataset=None, methods=None, num_classes=3, device=None, args=None):
         self.original_model = copy.deepcopy(model)
         self.model = model.to(device)
@@ -18,6 +18,9 @@ class IndependentTrainer:
         self.total_samples = len(self.train_dataset)
         self.device = device
         self.args = args
+
+        self.regularisation_active = False
+        self.skip_training = False
         
         # Initialise trackers
         self.aum_tracker = AumTracker(self.num_classes) if "aum" in self.methods else None
@@ -26,7 +29,10 @@ class IndependentTrainer:
         self.forgetting_tracker = ForgettingTracker(self.total_samples) if "forgetting" in self.methods else None
         self.grand_tracker = GrandTracker(self.total_samples) if "grand" in self.methods else None
         self.loss_tracker = LossTracker(self.total_samples) if "loss" in self.methods else None
-        self.regularisation_active = "regularisation" in self.methods
+        if "regularisation" in self.methods:
+            self.regularisation_active = True
+            if len(methods) == 1:
+                self.skip_training = True
 
         self.misclassified_once = np.zeros(self.total_samples, dtype=bool)
         
@@ -48,6 +54,7 @@ class IndependentTrainer:
         Train BERT with high dropout and L1 regularisation to identify hard/easy examples. 
         Misclassified examples are considered 'hard'.
         """
+        print("Starting Regularisation training")
         self.model.train()
 
         # Apply dropout
@@ -78,18 +85,29 @@ class IndependentTrainer:
 
                 total_loss += loss.item()
                 progress_bar.set_postfix(loss=loss.item())
-                self.track_metrics(logits, labels, dataset_indices)
+
+                predictions = torch.argmax(logits, dim=-1).cpu().numpy()
+                labels_cpu = labels.cpu().numpy()
+                correct_predictions = (predictions == labels_cpu)
+                for i, idx in enumerate(dataset_indices):
+                    if not correct_predictions[i]:
+                        self.misclassified_once[idx] = True
 
             print(f"[Regularisation] Epoch {epoch+1}, Avg Loss: {total_loss / len(train_dataloader):.4f}")
-            self.finalise_epoch()
-            # self.current_epoch += 1
+            self.current_epoch += 1
+        self.current_epoch = 0
         print("Regularisation training complete")
 
         # Reset model and optimiser
         self.model = copy.deepcopy(self.original_model).to(self.device)
         self.optimizer = torch.optim.Adam(self.model.parameters(), lr=self.args.learning_rate)
+        current_epoch = 0
     
     def train(self, num_epochs):
+        if self.regularisation_active:
+            self.regularisation_stage_train(num_epochs=num_epochs)
+        if self.skip_training:
+            return
         self.model.train()
         train_dataloader = self.get_dataloader(self.train_dataset, self.args.train_batch_size)
         
@@ -119,7 +137,6 @@ class IndependentTrainer:
 
             print(f"Epoch {epoch + 1}/{num_epochs}, Avg Loss: {total_loss / len(train_dataloader):.4f}")
             self.finalise_epoch()
-            # self.current_epoch += 1
     
     def track_metrics(self, logits, labels, dataset_indices):
         predictions = torch.argmax(logits, dim=-1).cpu().numpy()
@@ -127,7 +144,9 @@ class IndependentTrainer:
         
         while len(self.predictions) <= self.current_epoch:
             self.predictions.append([None] * self.total_samples)
+        dataset_indices = [int(idx) for idx in dataset_indices]
         for i, idx in enumerate(dataset_indices):
+            # idx = int(idx)
             self.predictions[self.current_epoch][idx] = predictions[i]
             if self.true_labels[idx] is None:
                 self.true_labels[idx] = labels_cpu[i]
@@ -135,12 +154,6 @@ class IndependentTrainer:
         detached_logits = logits.detach()
         detached_probs = torch.nn.functional.softmax(detached_logits, dim=-1)
 
-        if self.regularisation_active:
-            correct_predictions = (predictions == labels_cpu)
-            for i, idx in enumerate(dataset_indices):
-                if not correct_predictions[i]:
-                    self.misclassified_once[idx] = True
-            return
         if self.aum_tracker:
             self.aum_tracker.update(detached_logits, labels, dataset_indices)
         if self.data_map_tracker:
@@ -153,7 +166,7 @@ class IndependentTrainer:
         if self.loss_tracker:
             self.loss_tracker.update(logits=detached_logits, labels=labels, dataset_indices=dataset_indices)
         if self.grand_tracker:
-            logits = logits.clone().requires_grad_(True)
+            # logits = logits.clone().requires_grad_(True)
             self.grand_tracker.update(dataset_indices, logits, labels, self.model)
 
     def finalise_epoch(self):
@@ -167,6 +180,7 @@ class IndependentTrainer:
             self.el2n_tracker.finalise_epoch()
         if self.grand_tracker:
             self.grand_tracker.finalise_epoch()
+        self.current_epoch += 1
     
     def evaluate(self):
         self.model.eval()

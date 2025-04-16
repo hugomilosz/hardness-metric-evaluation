@@ -29,7 +29,7 @@ class AumTracker:
             labels_np = labels.detach().cpu().numpy()
             
             for i, sample_id in enumerate(sample_ids):
-                # Get logits, true label and class logit
+                sample_id = int(sample_id)
                 sample_logits = logits_np[i]
                 assigned_class = labels_np[i]
                 assigned_logit = sample_logits[assigned_class]
@@ -218,20 +218,19 @@ class GrandTracker:
 
     def update(self, dataset_indices, logits, labels, model):
         """ Update GraNd scores only for the classifier layer on top of PLM. """
-        # Clone logits to avoid in-place modification
-        logits = logits.clone().detach().requires_grad_(True)  # Ensure logits are tracked for gradients
-        params = list(model.classifier.parameters())  # Get classifier layer
+        logits = logits.clone().detach().requires_grad_(True)
+        params = list(model.classifier.parameters())
 
         batch_scores = []
-        for i in range(logits.size(0)):  # Iterate over batch
+        for i in range(logits.size(0)):
             # Compute the loss for each sample in the batch
-            loss = torch.nn.functional.cross_entropy(logits[i].unsqueeze(0), labels[i].unsqueeze(0), reduction='sum')
+            loss = torch.nn.functional.cross_entropy(logits, labels, reduction='sum')
 
             # Compute gradients w.r.t classifier layer
-            gradients = torch.autograd.grad(outputs=loss, inputs=params, create_graph=False, retain_graph=True, allow_unused=True)
+            loss.backward(retain_graph=True)
 
             # Compute L2 norm of gradients
-            grad_norms = torch.cat([g.view(-1) for g in gradients if g is not None], dim=0)
+            grad_norms = torch.cat([g.view(-1) for g in model.classifier.parameters() if g.grad is not None], dim=0)
             grand_score = torch.norm(grad_norms, p=2).item()
             batch_scores.append(grand_score)
 
@@ -256,6 +255,7 @@ class ForgettingTracker:
     def update(self, correct_predictions, sample_indices):
         """Update forgetting events for a batch"""
         for is_correct, sample_idx in zip(correct_predictions, sample_indices):
+            # sample_idx = int(sample_idx)
             if is_correct:
                 # first time learnt
                 if self.forgetting_events[sample_idx] == -1:
