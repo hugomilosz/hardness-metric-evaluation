@@ -185,6 +185,12 @@ class DataLoader:
             model_paths[model_name],
             num_labels=num_labels
         )
+        for param in model.parameters():
+            param.requires_grad = False  # Freeze all layers
+
+        # Unfreeze the classifier head (final classification layer)
+        for param in model.classifier.parameters():
+            param.requires_grad = True
         return model
 
     

@@ -22,6 +22,7 @@ class Trainer:
 
         self.regularisation_active = False
         self.skip_training = False
+        self.num_epochs = self.args.num_train_epochs
         
         # Initialise trackers
         self.aum_tracker = AumTracker(self.num_classes) if "aum" in self.methods else None
@@ -38,7 +39,7 @@ class Trainer:
         self.misclassified_once = np.zeros(self.total_samples, dtype=bool)
         
         self.true_labels = np.full(self.total_samples, np.nan)
-        self.predictions = np.full((self.args.num_train_epochs, self.total_samples), np.nan)
+        self.predictions = np.full((self.num_epochs, self.total_samples), np.nan)
         self.current_epoch = 0
         
         # Define optimiser and loss function
@@ -125,7 +126,7 @@ class Trainer:
         self.optimizer = torch.optim.Adam(self.model.parameters(), lr=self.args.learning_rate)
         self.current_epoch = 0
     
-    def train(self, num_epochs):
+    def train(self):
         if self.regularisation_active:
             self.regularisation_stage_train()
         if self.skip_training:
@@ -133,10 +134,10 @@ class Trainer:
         self.model.train()
         train_dataloader = self.get_dataloader(self.train_dataset, self.args.train_batch_size)
         
-        for epoch in range(num_epochs):
+        for epoch in range(self.num_epochs):
             self.model.train()
             total_loss = 0.0
-            progress_bar = tqdm(train_dataloader, desc=f"Epoch {epoch+1}/{num_epochs}", leave=True)
+            progress_bar = tqdm(train_dataloader, desc=f"Epoch {epoch+1}/{self.num_epochs}", leave=True)
 
             for batch in progress_bar:
                 dataset_indices = batch["idx"]
@@ -157,7 +158,7 @@ class Trainer:
                 progress_bar.set_postfix(loss=loss.item())
                 self.track_metrics(logits, labels, dataset_indices)
 
-            print(f"Epoch {epoch + 1}/{num_epochs}, Avg Loss: {total_loss / len(train_dataloader):.4f}")
+            print(f"Epoch {epoch + 1}/{self.num_epochs}, Avg Loss: {total_loss / len(train_dataloader):.4f}")
             self.finalise_epoch()
     
     def track_metrics(self, logits, labels, dataset_indices):
