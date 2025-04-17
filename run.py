@@ -37,7 +37,7 @@ AVAILABLE_MODELS = [
 
 AVAILABLE_DATASETS = [
     "multi_nli",
-    "civil-comments-wilds",
+    "civilcomments_wilds",
     # "fever",
     "qqp",
 ]

@@ -218,7 +218,7 @@ class GrandTracker:
 
     def update(self, dataset_indices, logits, labels, model):
         """ Update GraNd scores only for the classifier layer on top of PLM. """
-        logits = logits.clone().detach().requires_grad_(True)
+        logits = logits.detach().requires_grad_(True)
         params = list(model.classifier.parameters())
 
         batch_scores = []

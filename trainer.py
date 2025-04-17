@@ -8,16 +8,17 @@ from tqdm import tqdm
 from methods import AumTracker, DataMapTracker, EL2NTracker, ForgettingTracker, GrandTracker, LossTracker
 
 class Trainer:
-    def __init__(self, model, train_dataset, eval_dataset=None, methods=None, num_classes=3, device=None, args=None):
-        self.original_model = copy.deepcopy(model)
-        self.model = model.to(device)
-        self.train_dataset = train_dataset
-        self.eval_dataset = eval_dataset
+    def __init__(self, dataset_bundle, methods=None, device=None, args=None):
+        self.model = dataset_bundle.model.to(device)
+        self.original_model = copy.deepcopy(self.model)
+        self.train_dataset = dataset_bundle.train_dataset
+        self.eval_dataset = dataset_bundle.eval_dataset
         self.methods = methods or []
-        self.num_classes = num_classes
+        self.num_classes = dataset_bundle.num_labels
         self.total_samples = len(self.train_dataset)
         self.device = device
         self.args = args
+        self.dataset_name = dataset_bundle.dataset_name
 
         self.regularisation_active = False
         self.skip_training = False
@@ -36,11 +37,11 @@ class Trainer:
 
         self.misclassified_once = np.zeros(self.total_samples, dtype=bool)
         
-        self.predictions = []
-        self.true_labels = [None] * self.total_samples
+        self.true_labels = np.full(self.total_samples, np.nan)
+        self.predictions = np.full((self.args.num_train_epochs, self.total_samples), np.nan)
         self.current_epoch = 0
         
-        # Define optimizer and loss function
+        # Define optimiser and loss function
         self.optimizer = torch.optim.Adam(self.model.parameters(), lr=args.learning_rate)
         self.loss_fn = torch.nn.CrossEntropyLoss()
 
@@ -49,63 +50,84 @@ class Trainer:
     def get_dataloader(self, dataset, batch_size, shuffle=True):
         return DataLoader(dataset, batch_size=batch_size, shuffle=shuffle, num_workers=self.args.dataloader_num_workers)
     
-    def regularisation_stage_train(self, num_epochs=3, dropout_rate=0.3, l1_lambda=1e-5):
+    def regularisation_stage_train(self):
         """
-        Train BERT with high dropout and L1 regularisation to identify hard/easy examples. 
-        Misclassified examples are considered 'hard'.
+        Train transformer model for identification stage of JTT.
+        Adapted specifically for NLP tasks mentioned in the paper.
         """
-        print("Starting Regularisation training")
+        print("Starting JTT Identification Stage Training")
         self.model.train()
-
-        # Apply dropout
-        for module in self.model.modules():
-            if isinstance(module, torch.nn.Dropout):
-                module.p = dropout_rate
-
+        
+        # Configure hyperparameters based on dataset
+        if self.dataset_name == "multi_nli":
+            num_epochs = 2
+            learning_rate = 0.00002
+            l2_reg = 0.0  # No L2 regularization for MultiNLI
+        elif self.dataset_name == "civilcomments_wilds":
+            num_epochs = 2
+            learning_rate = 0.00001
+            l2_reg = 0.01
+        else:  # Default for other NLP datasets
+            num_epochs = 2
+            learning_rate = 0.00002
+            l2_reg = 0.01
+        
+        # Setup AdamW optimizer with weight decay (L2 regularisation)
+        optimizer = torch.optim.AdamW(
+            self.model.parameters(),
+            lr=learning_rate,
+            weight_decay=l2_reg
+        )
+        
         train_dataloader = self.get_dataloader(self.train_dataset, self.args.train_batch_size)
+        
         for epoch in range(num_epochs):
             total_loss = 0.0
-            progress_bar = tqdm(train_dataloader, desc=f"Regularisation Epoch {epoch+1}/{num_epochs}", leave=True)
+            progress_bar = tqdm(train_dataloader, desc=f"JTT Identification Epoch {epoch+1}/{num_epochs}", leave=True)
+            
             for batch in progress_bar:
                 dataset_indices = batch["idx"]
                 model_inputs = {key: value.to(self.device) for key, value in batch.items() if key != "idx"}
-
-                self.optimizer.zero_grad()
+                
+                optimizer.zero_grad()
                 outputs = self.model(**model_inputs)
                 logits = outputs.logits
                 labels = model_inputs["labels"]
-
-                # Cross-entropy + L1 regularisation
-                ce_loss = torch.nn.functional.cross_entropy(logits, labels)
-                l1_penalty = sum(param.abs().sum() for param in self.model.parameters())
-                loss = ce_loss + l1_lambda * l1_penalty
-
+                
+                # Cross-entropy loss
+                loss = torch.nn.functional.cross_entropy(logits, labels)
                 loss.backward()
-                self.optimizer.step()
-
+                
+                # Gradient clipping as mentioned in the paper
+                torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
+                
+                optimizer.step()
+                
                 total_loss += loss.item()
                 progress_bar.set_postfix(loss=loss.item())
-
+                
+                # Track misclassified examples
                 predictions = torch.argmax(logits, dim=-1).cpu().numpy()
                 labels_cpu = labels.cpu().numpy()
                 correct_predictions = (predictions == labels_cpu)
                 for i, idx in enumerate(dataset_indices):
                     if not correct_predictions[i]:
                         self.misclassified_once[idx] = True
-
-            print(f"[Regularisation] Epoch {epoch+1}, Avg Loss: {total_loss / len(train_dataloader):.4f}")
-            self.current_epoch += 1
-        self.current_epoch = 0
-        print("Regularisation training complete")
-
-        # Reset model and optimiser
+            
+            print(f"[JTT Identification] Epoch {epoch+1}, Avg Loss: {total_loss / len(train_dataloader):.4f}")
+        
+        # Count misclassified examples
+        num_misclassified = np.sum(self.misclassified_once)
+        print(f"Identified {num_misclassified} hard examples ({num_misclassified/self.total_samples:.2%} of dataset)")
+        
+        # Reset model and optimizer for the second stage
         self.model = copy.deepcopy(self.original_model).to(self.device)
         self.optimizer = torch.optim.Adam(self.model.parameters(), lr=self.args.learning_rate)
-        current_epoch = 0
+        self.current_epoch = 0
     
     def train(self, num_epochs):
         if self.regularisation_active:
-            self.regularisation_stage_train(num_epochs=num_epochs)
+            self.regularisation_stage_train()
         if self.skip_training:
             return
         self.model.train()
@@ -141,33 +163,32 @@ class Trainer:
     def track_metrics(self, logits, labels, dataset_indices):
         predictions = torch.argmax(logits, dim=-1).cpu().numpy()
         labels_cpu = labels.cpu().numpy()
-        
-        while len(self.predictions) <= self.current_epoch:
-            self.predictions.append([None] * self.total_samples)
-        dataset_indices = [int(idx) for idx in dataset_indices]
-        for i, idx in enumerate(dataset_indices):
-            # idx = int(idx)
-            self.predictions[self.current_epoch][idx] = predictions[i]
-            if self.true_labels[idx] is None:
-                self.true_labels[idx] = labels_cpu[i]
-        
+        dataset_indices = np.array(dataset_indices)
+
+        # Update predictions for the current epoch
+        self.predictions[self.current_epoch][dataset_indices] = predictions
+
+        # Only update unseen true labels
+        unseen_mask = np.isnan(self.true_labels[dataset_indices])
+        self.true_labels[dataset_indices[unseen_mask]] = labels_cpu[unseen_mask]
+
+        # Continue with tracker updates
         detached_logits = logits.detach()
         detached_probs = torch.nn.functional.softmax(detached_logits, dim=-1)
 
         if self.aum_tracker:
-            self.aum_tracker.update(detached_logits, labels, dataset_indices)
+            self.aum_tracker.update(detached_logits, labels, dataset_indices.tolist())
         if self.data_map_tracker:
-            self.data_map_tracker.update(dataset_indices, detached_logits, labels, detached_probs)
+            self.data_map_tracker.update(dataset_indices.tolist(), detached_logits, labels, detached_probs)
         if self.el2n_tracker:
-            self.el2n_tracker.update(dataset_indices, detached_probs, labels)
+            self.el2n_tracker.update(dataset_indices.tolist(), detached_probs, labels)
         if self.forgetting_tracker:
             correct_predictions = (predictions == labels_cpu)
-            self.forgetting_tracker.update(correct_predictions, dataset_indices)
+            self.forgetting_tracker.update(correct_predictions, dataset_indices.tolist())
         if self.loss_tracker:
-            self.loss_tracker.update(logits=detached_logits, labels=labels, dataset_indices=dataset_indices)
+            self.loss_tracker.update(logits=detached_logits, labels=labels, dataset_indices=dataset_indices.tolist())
         if self.grand_tracker:
-            # logits = logits.clone().requires_grad_(True)
-            self.grand_tracker.update(dataset_indices, logits, labels, self.model)
+            self.grand_tracker.update(dataset_indices.tolist(), logits, labels, self.model)
 
     def finalise_epoch(self):
         if self.loss_tracker:

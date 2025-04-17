@@ -4,6 +4,18 @@ from torch.utils.data import Dataset
 from transformers import AutoTokenizer, AutoModelForSequenceClassification
 from wilds import get_dataset
 
+from dataclasses import dataclass
+from transformers import PreTrainedTokenizer, PreTrainedModel
+
+@dataclass
+class DatasetBundle:
+    model: PreTrainedModel
+    train_dataset: Dataset
+    eval_dataset: Dataset
+    tokenizer: PreTrainedTokenizer
+    num_labels: int
+    dataset_name: str
+
 class CustomWILDSDataset(Dataset):
     """Custom wrapper for WILDS dataset to make it compatible with CustomTrainer"""
     
@@ -189,4 +201,4 @@ class DataLoader:
 
         model = self.get_model(self.model_name, num_labels)
             
-        return train_dataset, eval_dataset, self.tokenizer, num_labels, model
+        return DatasetBundle(model, train_dataset, eval_dataset, self.tokenizer, num_labels, self.dataset_name)
