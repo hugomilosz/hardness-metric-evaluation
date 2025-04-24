@@ -1,192 +1,244 @@
-import torch
-from transformers import Trainer, get_linear_schedule_with_warmup
+import copy
 import numpy as np
-from methods import LossTracker
-from methods import ForgettingTracker
-
 import torch
+from torch.utils.data import DataLoader
+from transformers import Trainer
 from tqdm import tqdm
-import time
 
-class CustomTrainer:
-    def __init__(self, model, train_dataset, eval_dataset=None, optimizer=None, loss_fn=None, methods=None, batch_size=32, shuffle=True, device=None):
-        """
-        Initialises the custom trainer.
+from methods import AumTracker, DataMapTracker, EL2NTracker, ForgettingTracker, GrandTracker, LossTracker
 
-        Args:
-            model: The model to be trained.
-            train_dataset: The training dataset.
-            eval_dataset: The evaluation dataset (optional).
-            optimizer: The optimizer used during training.
-            loss_fn: The loss function used during training.
-            methods: List of tracking methods like "loss" and "forgetting".
-            batch_size: The batch size for training.
-            shuffle: Whether to shuffle the dataset.
-            device: The device to train the model on (e.g., 'cpu' or 'cuda').
-        """
-        self.model = model
-        self.train_dataset = train_dataset
-        self.eval_dataset = eval_dataset
-        self.optimizer = optimizer
-        self.loss_fn = loss_fn
+class Trainer:
+    def __init__(self, dataset_bundle, methods=None, device=None, args=None):
+        self.model = dataset_bundle.model.to(device)
+        self.original_model = copy.deepcopy(self.model)
+        self.train_dataset = dataset_bundle.train_dataset
+        self.eval_dataset = dataset_bundle.eval_dataset
         self.methods = methods or []
-        self.batch_size = batch_size
-        self.shuffle = shuffle
-        self.device = device or ('cuda' if torch.cuda.is_available() else 'cpu')
+        self.num_classes = dataset_bundle.num_labels
+        self.total_samples = len(self.train_dataset)
+        self.device = device
+        self.args = args
+        self.dataset_name = dataset_bundle.dataset_name
 
-        self.loss_tracker = LossTracker(len(train_dataset)) if "loss" in self.methods else None
-        self.forgetting_tracker = ForgettingTracker(len(train_dataset)) if "forgetting" in self.methods else None
+        self.regularisation_active = False
+        self.skip_training = False
+        self.num_epochs = self.args.num_train_epochs
+        
+        # Initialise trackers
+        self.aum_tracker = AumTracker(self.num_classes) if "aum" in self.methods else None
+        self.data_map_tracker = DataMapTracker(self.total_samples) if "datamaps" in self.methods else None
+        self.el2n_tracker = EL2NTracker(self.total_samples) if "el2n" in self.methods else None
+        self.forgetting_tracker = ForgettingTracker(self.total_samples) if "forgetting" in self.methods else None
+        self.grand_tracker = GrandTracker(self.total_samples) if "grand" in self.methods else None
+        self.loss_tracker = LossTracker(self.total_samples) if "loss" in self.methods else None
+        if "regularisation" in self.methods:
+            self.regularisation_active = True
+            if len(methods) == 1:
+                self.skip_training = True
 
-        # Move model to the correct device
-        self.model.to(self.device)
+        self.misclassified_once = np.zeros(self.total_samples, dtype=bool)
+        
+        self.true_labels = np.full(self.total_samples, np.nan)
+        self.predictions = np.full((self.num_epochs, self.total_samples), np.nan)
+        self.current_epoch = 0
+        
+        # Define optimiser and loss function
+        self.optimizer = torch.optim.Adam(self.model.parameters(), lr=args.learning_rate)
+        self.loss_fn = torch.nn.CrossEntropyLoss()
+        
+        # List to hold binary arrays of misclassified indices
+        self.epochwise_misclassified = []
 
-    def _get_dataloader(self, dataset):
-        """Helper function to get DataLoader with shuffling enabled."""
-        def custom_collate_fn(batch):
-            # Manually handle padding if needed
-            input_ids = [item['input_ids'] for item in batch]
-            attention_mask = [item['attention_mask'] for item in batch]
-            labels = [item['labels'] for item in batch]
-            idx = [item['idx'] for item in batch]
-            
-            # Pad sequences manually if needed
-            input_ids = torch.nn.utils.rnn.pad_sequence(input_ids, batch_first=True, padding_value=0)
-            attention_mask = torch.nn.utils.rnn.pad_sequence(attention_mask, batch_first=True, padding_value=0)
-            labels = torch.tensor(labels)
-            idx = torch.tensor(idx)
-
-            return {
-                'input_ids': input_ids,
-                'attention_mask': attention_mask,
-                'labels': labels,
-                'idx': idx
-            }
-        return torch.utils.data.DataLoader(dataset, batch_size=self.batch_size, shuffle=self.shuffle, collate_fn=custom_collate_fn)
-
-    def _train_one_epoch(self):
-        """Train the model for one epoch."""
+        torch.autograd.set_detect_anomaly(True)
+    
+    def get_dataloader(self, dataset, batch_size, shuffle=True):
+        return DataLoader(dataset, batch_size=batch_size, shuffle=shuffle, num_workers=self.args.dataloader_num_workers)
+    
+    def regularisation_stage_train(self):
+        """
+        Train transformer model for identification stage of JTT.
+        Adapted specifically for NLP tasks mentioned in the paper.
+        """
+        print("Starting JTT Identification Stage Training")
         self.model.train()
-        train_dataloader = self._get_dataloader(self.train_dataset)
-        total_loss = 0
-        total_correct = 0
-        total_samples = 0
+        
+        # Hyperparameters based on dataset - from the paper
+        if self.dataset_name == "multi_nli":
+            learning_rate = 0.00002
+            l2_reg = 0.0  # No L2 regularization for MultiNLI
+        elif self.dataset_name == "civilcomments_wilds":
+            learning_rate = 0.00001
+            l2_reg = 0.01
+        else:  # Default for other NLP datasets
+            learning_rate = 0.00002
+            l2_reg = 0.01
+        
+        # Setup AdamW optim with L2 regularisation
+        optimizer = torch.optim.AdamW(
+            self.model.parameters(),
+            lr=learning_rate,
+            weight_decay=l2_reg
+        )
+        
+        train_dataloader = self.get_dataloader(self.train_dataset, self.args.train_batch_size)
+    
+        for epoch in range(self.num_epochs):
+            total_loss = 0.0
+            epoch_misclassified = np.zeros(self.total_samples, dtype=int)
 
-        scaler = torch.cuda.amp.GradScaler()
-        start_time = time.time()
+            progress_bar = tqdm(train_dataloader, desc=f"JTT Identification Epoch {epoch+1}/{self.num_epochs}", leave=True)
 
-        for batch in tqdm(train_dataloader, desc="Training", ncols=100):
-            self.optimizer.zero_grad()
+            for batch in progress_bar:
+                dataset_indices = batch["idx"]
+                model_inputs = {key: value.to(self.device) for key, value in batch.items() if key != "idx"}
 
-            dataset_indices = batch.get('idx', None)
-            if dataset_indices is not None:
-                dataset_indices = dataset_indices.cpu().numpy().tolist()
-
-            inputs = {key: value.to(self.device) for key, value in batch.items() if key != 'idx'}
-
-            # Forward pass
-            with torch.cuda.amp.autocast():
-                outputs = self.model(**inputs)
+                optimizer.zero_grad()
+                outputs = self.model(**model_inputs)
                 logits = outputs.logits
-                labels = inputs['labels']
-                loss = self.loss_fn(logits, labels)
+                labels = model_inputs["labels"]
 
-            # Backward pass
-            scaler.scale(loss).backward()
-            scaler.step(self.optimizer)
-            self.scheduler.step()
-            scaler.update()
+                loss = torch.nn.functional.cross_entropy(logits, labels)
+                loss.backward()
 
-            # Track loss and forgetting metrics
-            total_loss += loss.item()
+                torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
+                optimizer.step()
 
-            # Track predictions and forgetting
-            predictions = torch.argmax(logits, dim=-1)
-            correct_predictions = (predictions == labels).sum().item()
+                total_loss += loss.item()
+                progress_bar.set_postfix(loss=loss.item())
 
-            total_correct += correct_predictions
-            total_samples += len(labels)
+                # Track misclassified samples for this epoch
+                predictions = torch.argmax(logits, dim=-1).cpu().numpy()
+                labels_cpu = labels.cpu().numpy()
+                indices_cpu = dataset_indices.cpu().numpy()
 
-            # If needed, update the trackers
-            if self.loss_tracker:
-                # Ensure that the 'idx' field is passed to the tracker for loss calculation
-                dataset_indices = batch.get('idx', None)
-                if dataset_indices is not None:
-                    self.loss_tracker.update_from_batch(logits, labels, dataset_indices.cpu().numpy().tolist())
+                incorrect = predictions != labels_cpu
+                epoch_misclassified[indices_cpu[incorrect]] = 1
+            print(f"[JTT Identification] Epoch {epoch+1}, Avg Loss: {total_loss / len(train_dataloader):.4f}")
+            self.epochwise_misclassified.append(epoch_misclassified)
 
-            if self.forgetting_tracker:
-                # Update forgetting tracker (correct predictions vs true labels)
-                correct_predictions_np = (predictions == labels).cpu().numpy()
-                dataset_indices = batch.get('idx', None)
-                if dataset_indices is not None:
-                    self.forgetting_tracker.update(correct_predictions_np, dataset_indices.cpu().numpy().tolist())
+        # Reset model and optimiser for the second stage of training
+        self.model = copy.deepcopy(self.original_model).to(self.device)
+        self.optimizer = torch.optim.Adam(self.model.parameters(), lr=self.args.learning_rate)
+        self.current_epoch = 0
+    
+    def train(self):
+        if self.regularisation_active:
+            self.regularisation_stage_train()
+        if self.skip_training:
+            return
+        self.model.train()
+        train_dataloader = self.get_dataloader(self.train_dataset, self.args.train_batch_size)
+        
+        for epoch in range(self.num_epochs):
+            self.model.train()
+            total_loss = 0.0
+            progress_bar = tqdm(train_dataloader, desc=f"Epoch {epoch+1}/{self.num_epochs}", leave=True)
 
-        if self.loss_tracker:
-            self.loss_tracker.finalise_epoch()
+            for batch in progress_bar:
+                dataset_indices = batch["idx"]
+                model_inputs = {key: value.to(self.device) for key, value in batch.items() if key != "idx"}
 
-        avg_loss = total_loss / len(train_dataloader)
-        accuracy = total_correct / total_samples
-        return avg_loss, accuracy
-
-    def _evaluate(self):
-        """Evaluate the model."""
-        self.model.eval()
-        eval_dataloader = self._get_dataloader(self.eval_dataset) if self.eval_dataset else None
-        total_loss = 0
-        total_correct = 0
-        total_samples = 0
-
-        with torch.no_grad():
-            for batch in tqdm(eval_dataloader, desc="Evaluating", ncols=100):
-                inputs = {key: value.to(self.device) for key, value in batch.items() if key != 'idx'}
-
-                # Forward pass
-                outputs = self.model(**inputs)
+                self.optimizer.zero_grad()
+                outputs = self.model(**model_inputs)
                 logits = outputs.logits
-                labels = inputs['labels']
+                labels = model_inputs["labels"]
 
-                # Calculate loss
-                loss = self.loss_fn(logits, labels)
+                loss = torch.nn.functional.cross_entropy(logits, labels)
+                loss.backward(retain_graph=True)
+                self.optimizer.step()
+
                 total_loss += loss.item()
 
-                # Track predictions
-                predictions = torch.argmax(logits, dim=-1)
-                correct_predictions = (predictions == labels).sum().item()
+                # Update progress bar
+                progress_bar.set_postfix(loss=loss.item())
+                self.track_metrics(logits, labels, dataset_indices, model_inputs)
 
-                total_correct += correct_predictions
-                total_samples += len(labels)
+            print(f"Epoch {epoch + 1}/{self.num_epochs}, Avg Loss: {total_loss / len(train_dataloader):.4f}")
+            self.finalise_epoch()
+    
+    def track_metrics(self, logits, labels, dataset_indices, model_inputs):
+        predictions = torch.argmax(logits, dim=-1).cpu().numpy()
+        labels_cpu = labels.cpu().numpy()
+        dataset_indices = np.array(dataset_indices)
 
-        avg_loss = total_loss / len(eval_dataloader)
-        accuracy = total_correct / total_samples
-        return avg_loss, accuracy
+        # Update predictions for the current epoch
+        self.predictions[self.current_epoch][dataset_indices] = predictions
 
-    def train(self, epochs):
-        """Train the model for the specified number of epochs."""
-        self.scheduler = get_linear_schedule_with_warmup(
-            self.optimizer, 
-            num_warmup_steps=0,
-            num_training_steps=len(self.train_dataset) * 3 // self.batch_size
-        )
+        # Only update unseen true labels
+        unseen_mask = np.isnan(self.true_labels[dataset_indices])
+        self.true_labels[dataset_indices[unseen_mask]] = labels_cpu[unseen_mask]
 
-        for epoch in range(epochs):
-            print(f"Epoch {epoch + 1}/{epochs}")
-            train_loss, train_accuracy = self._train_one_epoch()
-            print(f"Training Loss: {train_loss:.4f}, Training Accuracy: {train_accuracy:.4f}")
+        # Continue with tracker updates
+        detached_logits = logits.detach()
+        detached_probs = torch.nn.functional.softmax(detached_logits, dim=-1)
 
-            if self.eval_dataset:
-                eval_loss, eval_accuracy = self._evaluate()
-                print(f"Evaluation Loss: {eval_loss:.4f}, Evaluation Accuracy: {eval_accuracy:.4f}")
-
-            # Optionally, print stats from trackers
-            if self.loss_tracker:
-                print("Loss stats:", self.loss_tracker.get_stats())
-            if self.forgetting_tracker:
-                print("Forgetting stats:", self.forgetting_tracker.get_stats())
-
-    def get_stats(self):
-        """Get stats from trackers."""
-        stats = {}
-        if self.loss_tracker:
-            stats['loss_stats'] = self.loss_tracker.get_stats()
+        if self.aum_tracker:
+            self.aum_tracker.update(detached_logits, labels, dataset_indices.tolist())
+        if self.data_map_tracker:
+            self.data_map_tracker.update(dataset_indices.tolist(), detached_logits, labels, detached_probs)
+        if self.el2n_tracker:
+            self.el2n_tracker.update(dataset_indices.tolist(), detached_probs, labels)
         if self.forgetting_tracker:
-            stats['forgetting_stats'] = self.forgetting_tracker.get_stats()
+            correct_predictions = (predictions == labels_cpu)
+            self.forgetting_tracker.update(correct_predictions, dataset_indices.tolist())
+        if self.loss_tracker:
+            self.loss_tracker.update(logits=detached_logits, labels=labels, dataset_indices=dataset_indices.tolist())
+        if self.grand_tracker:
+            self.grand_tracker.update(dataset_indices.tolist(), logits, labels, self.model)
+
+    def finalise_epoch(self):
+        if self.loss_tracker:
+            self.loss_tracker.finalise_epoch()
+        if self.data_map_tracker:
+            self.data_map_tracker.finalise_epoch()
+        if self.aum_tracker:
+            self.aum_tracker.finalise_epoch()
+        if self.el2n_tracker:
+            self.el2n_tracker.finalise_epoch()
+        if self.grand_tracker:
+            self.grand_tracker.finalise_epoch()
+        if self.forgetting_tracker:
+            self.forgetting_tracker.finalise_epoch()
+        self.current_epoch += 1
+    
+    def evaluate(self):
+        self.model.eval()
+        eval_dataloader = self.get_dataloader(self.eval_dataset, self.args.eval_batch_size, shuffle=False)
+        
+        correct = 0
+        total = 0
+        with torch.no_grad():
+            for batch in eval_dataloader:
+                inputs = {k: v.to(self.device) for k, v in batch.items()}
+                labels = inputs['labels']
+                outputs = self.model(**inputs)
+                logits = outputs.logits
+                predictions = torch.argmax(logits, dim=-1)
+                
+                correct += (predictions == labels).sum().item()
+                total += labels.size(0)
+        
+        accuracy = correct / total
+        print(f"Evaluation Accuracy: {accuracy:.4f}")
+        return accuracy
+    
+    def get_unified_stats(self):
+        stats = {}
+        if self.aum_tracker:
+            stats['aum'] = self.aum_tracker.get_stats()
+        if self.data_map_tracker:
+            stats['datamap'] = self.data_map_tracker.get_stats()
+        if self.el2n_tracker:
+            stats['el2n'] = self.el2n_tracker.get_scores()
+        if self.forgetting_tracker:
+            stats['forgetting'] = self.forgetting_tracker.get_stats()
+        if self.grand_tracker:
+            stats['grand'] = self.grand_tracker.get_scores()
+        if self.loss_tracker:
+            stats['loss'] = self.loss_tracker.get_stats()
+        if self.regularisation_active:
+            stats['regularisation'] = self.epochwise_misclassified
+        
+        stats['predictions'] = self.predictions
+        stats['true_labels'] = self.true_labels
         return stats
