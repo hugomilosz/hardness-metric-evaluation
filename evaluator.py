@@ -1,138 +1,182 @@
 import numpy as np
+from sklearn.mixture import GaussianMixture
+from sklearn.preprocessing import StandardScaler
 
 class Evaluator:
     def __init__(self, total_samples, stats):
         self.total_samples = total_samples
         self.scores_by_method = {}
         self.percentile = 80
-        self._parse_stats(stats)
 
-    def _parse_stats(self, stats):
+        # Storage for binary difficulty labels
+        self.binary_scores = {}
+        self._evaluate(stats)
+
+    def _evaluate(self, stats):
         # AUM
-        if "aum" in stats and "sample_margins" in stats["aum"]:
-            aum = stats["aum"]["sample_margins"]
-            num_epochs = max(len(v) for v in aum.values())
-            arr = np.full((num_epochs, self.total_samples), np.nan)
-            for sample_id, values in aum.items():
-                arr[:len(values), sample_id] = values
-            self.scores_by_method["aum"] = arr
+        if "aum" in stats and "datamap" in stats:
+            aum_scores = stats["aum"]["sample_margins"]
+            confidence_scores = stats["datamap"]["confidence"]
+            variability_scores = stats["datamap"]["variability"]
+            correctness_scores = stats["datamap"]["correctness"]
+            self.binary_scores["aum"] = self._binary_from_aum(aum_scores, confidence_scores, variability_scores, correctness_scores)
+            self.binary_scores["datamap"] = self._binary_from_datamap(confidence_scores, variability_scores, correctness_scores)
 
         # EL2N
         if "el2n" in stats:
-            el2n = np.array(stats["el2n"])
-            self.scores_by_method["el2n"] = el2n
+            el2n_scores = stats["el2n"]
+            self.binary_scores["el2n"] = self._binary_from_el2n(el2n_scores)
 
         # GraNd
         if "grand" in stats:
-            grand = np.array(stats["grand"])
-            self.scores_by_method["grand"] = grand
+            grand_scores = stats["grand"]
+            self.binary_scores["grand"] = self._binary_from_grand(grand_scores)
 
         # Loss
-        if "loss" in stats and "all_losses" in stats["loss"]:
-            loss = np.array(stats["loss"]["all_losses"])
-            self.scores_by_method["loss"] = loss
-
-        # DataMap
-        if "datamap" in stats:
-            dm = stats["datamap"]
-            if "confidence" in dm:
-                conf = np.array(dm["confidence"])
-                self.scores_by_method["confidence"] = self._repeat_across_epochs(conf)
-            if "variability" in dm:
-                var = np.array(dm["variability"])
-                self.scores_by_method["variability"] = self._repeat_across_epochs(var)
-            if "correctness" in dm:
-                corr = np.array(dm["correctness"])
-                self.scores_by_method["correctness"] = self._repeat_across_epochs(corr)
+        if "loss" in stats:
+            loss = stats["loss"]["all_losses"]
+            self.binary_scores["loss"] = self._binary_from_loss(loss)
 
         # Forgetting
-        if "forgetting" in stats and "forgetting_events" in stats["forgetting"]:
-            forgetting = stats["forgetting"]["forgetting_events"]
-            arr = np.full((1, self.total_samples), np.nan)
-            for idx, val in forgetting.items():
-                arr[0, idx] = val if val >= 0 else np.nan
-            self.scores_by_method["forgetting"] = arr
+        if "forgetting" in stats:
+            forgetting = stats["forgetting"]["epoch_history"]
+            self.binary_scores["forgetting"] = self._binary_from_forgetting(forgetting)
 
         # Regularisation
         if "regularisation" in stats:
-            regular = np.array(stats["regularisation"])
-            self.scores_by_method["regularisation"] = self._repeat_across_epochs(regular)
+            self.binary_scores["regularisation"] = stats["regularisation"]
 
-    def get_binary_difficulty(self, method_name):
-        method_func = getattr(self, f"_binary_from_{method_name}", None)
-        if method_func is None:
-            raise NotImplementedError(f"No binary difficulty logic implemented for method: {method_name}")
-        return method_func()
+    def _binary_from_aum(self, aum_scores, confidence_scores, variability_scores, correctness_scores):
+        if any(x is None for x in [aum_scores, confidence_scores, variability_scores, correctness_scores]):
+            raise ValueError("Missing one or more required features: AUM, confidence, variability, correctness")
 
-    def _binary_from_aum(self):
-        aum_scores = self.scores_by_method.get("aum")
-        raise NotImplementedError(f"Not implemented")
+        sample_ids = sorted(aum_scores.keys())
+        aum_array = np.array([aum_scores[sid] for sid in sample_ids])
+        aum_array = np.transpose(aum_array)
 
-    def _binary_from_el2n(self):
-        el2n_scores = self.scores_by_method.get("el2n")
+        num_epochs = aum_array.shape[0]
+        binary_labels_over_epochs = []
+
+        for epoch_idx in range(num_epochs):
+            aum = np.nanmean(aum_array[:epoch_idx + 1], axis=0)
+
+            conf = confidence_scores[epoch_idx]
+            var = variability_scores[epoch_idx]
+            corr = correctness_scores[epoch_idx]
+
+            features = np.stack([aum, conf, var, corr], axis=1)
+            valid_mask = ~np.isnan(features).any(axis=1)
+            valid_features = features[valid_mask]
+
+            scaler = StandardScaler()
+            norm_features = scaler.fit_transform(valid_features)
+
+            gmm = GaussianMixture(n_components=3, random_state=42)
+            cluster_labels = gmm.fit_predict(norm_features)
+
+            conf_valid = conf[valid_mask]
+            cluster_conf_means = [conf_valid[cluster_labels == i].mean() for i in range(3)]
+            hard_cluster = int(np.argmin(cluster_conf_means))
+
+            binary_valid = (cluster_labels == hard_cluster).astype(int)
+
+            binary_labels = np.zeros(len(conf), dtype=int)
+            binary_labels[valid_mask] = binary_valid
+            binary_labels_over_epochs.append(binary_labels)
+
+        return binary_labels_over_epochs
+
+    def _binary_from_el2n(self, el2n_scores):
         num_epochs = len(el2n_scores)
         el2n_array = np.array(el2n_scores)
         binary_labels_over_epochs = []
 
         for epoch_idx in range(num_epochs):
-            # Mean across epochs 0 to epoch_idx
-            mean_scores = np.nanmean(el2n_array[:epoch_idx + 1], axis=0)
-            valid_scores = mean_scores[~np.isnan(mean_scores)]
+            current_scores = el2n_array[epoch_idx]
+            valid_scores = current_scores[~np.isnan(current_scores)]
             threshold = np.percentile(valid_scores, self.percentile)
 
-            binary_labels = np.where(mean_scores >= threshold, 1, 0)
+            binary_labels = np.where(current_scores >= threshold, 1, 0)
             binary_labels_over_epochs.append(binary_labels)
 
         return binary_labels_over_epochs
 
-    def _binary_from_grand(self):
-        grand_scores = self.scores_by_method.get("grand")
+
+    def _binary_from_grand(self, grand_scores):
         num_epochs = len(grand_scores)
         grand_array = np.array(grand_scores)
         binary_labels_over_epochs = []
 
         for epoch_idx in range(num_epochs):
-            # Mean across epochs 0 to epoch_idx
-            mean_scores = np.nanmean(grand_array[:epoch_idx + 1], axis=0)
-            valid_scores = mean_scores[~np.isnan(mean_scores)]
+            current_scores = grand_array[epoch_idx]
+            valid_scores = current_scores[~np.isnan(current_scores)]
             threshold = np.percentile(valid_scores, self.percentile)
 
-            binary_labels = np.where(mean_scores >= threshold, 1, 0)
+            binary_labels = np.where(current_scores >= threshold, 1, 0)
             binary_labels_over_epochs.append(binary_labels)
 
         return binary_labels_over_epochs
 
-    def _binary_from_loss(self):
-        loss_scores = self.scores_by_method.get("loss")
+    def _binary_from_loss(self, loss_scores):
         num_epochs = len(loss_scores)
         loss_array = np.array(loss_scores)
         binary_labels_over_epochs = []
 
         for epoch_idx in range(num_epochs):
-            # Mean across epochs 0 to epoch_idx
-            mean_scores = np.nanmean(loss_array[:epoch_idx + 1], axis=0)
-            valid_scores = mean_scores[~np.isnan(mean_scores)]
+            current_loss = loss_array[epoch_idx]
+            valid_scores = current_loss[~np.isnan(current_loss)]
             threshold = np.percentile(valid_scores, self.percentile)
 
-            binary_labels = np.where(mean_scores >= threshold, 1, 0)
+            binary_labels = np.where(current_loss >= threshold, 1, 0)
             binary_labels_over_epochs.append(binary_labels)
 
         return binary_labels_over_epochs
 
-    def _binary_from_datamaps(self):
-        confidence_scores = np.array(self.scores_by_method.get("confidence"))  # shape [epochs, samples]
-        variability_scores = np.array(self.scores_by_method.get("variability"))  # same shape
-        raise NotImplementedError(f"Not implemented")
+    def _binary_from_datamap(self, confidence_scores, variability_scores, correctness_scores):
+        if any(x is None for x in [confidence_scores, variability_scores, correctness_scores]):
+            raise ValueError("Missing one or more required Data Maps features.")
 
-    def _binary_from_forgetting(self):
-        forgetting = self.scores_by_method.get("forgetting")
+        confidence_scores = np.array(confidence_scores)
+        variability_scores = np.array(variability_scores)
+        correctness_scores = np.array(correctness_scores)
+        num_epochs = confidence_scores.shape[0]
         binary_labels_over_epochs = []
-        for forgetting_per_epoch in forgetting:
-            binary_labels_over_epochs.append(np.array(forgetting_per_epoch > 0))
+
+        for epoch_idx in range(num_epochs):
+            conf = confidence_scores[epoch_idx]
+            var = variability_scores[epoch_idx]
+            corr = correctness_scores[epoch_idx]
+
+            valid_mask = ~np.isnan(conf) & ~np.isnan(var) & ~np.isnan(corr)
+            num_valid = valid_mask.sum()
+            binary_labels = np.ones_like(conf, dtype=int)  # Default all to hard (1)
+
+            if num_valid == 0:
+                binary_labels_over_epochs.append(binary_labels)
+                continue
+
+            # Composite "ease" score: high confidence, low variability = easier
+            # We subtract var to make lower variability increase the score
+            ease_score = conf[valid_mask] - var[valid_mask]
+
+            # Get threshold to label bottom 33% as easy
+            threshold = np.percentile(ease_score, 33)
+            easy_indices = np.where(valid_mask)[0][ease_score <= threshold]
+            binary_labels[easy_indices] = 0
+            binary_labels_over_epochs.append(binary_labels)
+
         return binary_labels_over_epochs
 
-    # Probably don't need this as scores are already 'binarised'
+    def _binary_from_forgetting(self, forgetting):
+        binary_labels_over_epochs = []
+
+        for forgetting_counts in forgetting:
+            counts = np.array(forgetting_counts)
+            # Hard if never learned (-1) or forgotten (>=1)
+            binary_labels = np.where((counts == -1) | (counts >= 1), 1, 0)
+            binary_labels_over_epochs.append(binary_labels)
+
+        return binary_labels_over_epochs
+
     def _binary_from_regularisation(self):
-        # Misclassified examples are hard
-        regular = self.scores_by_method.get("regularisation")
-        raise NotImplementedError(f"Not implemented")
+        return self.scores_by_method.get("regularisation")

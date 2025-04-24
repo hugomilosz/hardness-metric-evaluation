@@ -141,8 +141,12 @@ class DataMapTracker:
             Average predictive confidence across epochs: np.array(n_samples)
         """
         if self.gold_label_probs is None:
-            return np.array([])
-        return np.nanmean(self.gold_label_probs, axis=1)
+            return []
+        num_epochs = self.gold_label_probs.shape[1]
+        return [
+            np.nanmean(self.gold_label_probs[:, :epoch_idx + 1], axis=1)
+            for epoch_idx in range(num_epochs)
+        ]
     
     @property
     def variability(self):
@@ -151,8 +155,12 @@ class DataMapTracker:
             Epistemic variability of true label probability across epochs: np.array(n_samples)
         """
         if self.gold_label_probs is None:
-            return np.array([])
-        return np.nanstd(self.gold_label_probs, axis=1)
+            return []
+        num_epochs = self.gold_label_probs.shape[1]
+        return [
+            np.nanstd(self.gold_label_probs[:, :epoch_idx + 1], axis=1)
+            for epoch_idx in range(num_epochs)
+        ]
     
     @property
     def correctness(self):
@@ -161,8 +169,12 @@ class DataMapTracker:
             Proportion of times a sample is predicted correctly across epochs: np.array(n_samples)
         """
         if self.gold_label_probs is None:
-            return np.array([])
-        return np.nanmean(self.gold_label_probs > 0.5, axis=1)
+            return []
+        num_epochs = self.gold_label_probs.shape[1]
+        return [
+            np.nanmean(self.gold_label_probs[:, :epoch_idx + 1] > 0.5, axis=1)
+            for epoch_idx in range(num_epochs)
+        ]
     
     def get_stats(self):
         """
@@ -211,76 +223,99 @@ class EL2NTracker:
         return np.array(self.el2n_scores)
 
 class GrandTracker:
+#     def __init__(self, total_samples):
+#         self.total_samples = total_samples
+#         self.grand_scores = []
+#         self.current_epoch_scores = np.full(self.total_samples, np.nan)
+
+#     def update(self, dataset_indices, logits, labels, model):
+#         logits = logits.detach().requires_grad_(True)
+#         losses = torch.nn.functional.cross_entropy(logits, labels, reduction='none')
+        
+#         for i in range(logits.size(0)):
+#             model.classifier.zero_grad()
+#             losses[i].backward(retain_graph=True)
+
+#             grad_norm = 0.0
+#             for param in model.classifier.parameters():
+#                 if param.grad is not None:
+#                     grad_norm += (param.grad.detach() ** 2).sum().item()
+#             grad_norm = grad_norm ** 0.5
+
+#             self.current_epoch_scores[dataset_indices[i]] = grad_norm
+
+#     def finalise_epoch(self):
+#         self.grand_scores.append(self.current_epoch_scores.copy())
+#         self.current_epoch_scores = np.full(self.total_samples, np.nan)
+
+#     def get_scores(self):
+#         return np.array(self.grand_scores)
+
     def __init__(self, total_samples):
         self.total_samples = total_samples
         self.grand_scores = []
-        self.current_epoch_scores = np.full(self.total_samples, np.nan)
-
+        self.current_epoch_scores = np.full(total_samples, np.nan)
+        
     def update(self, dataset_indices, logits, labels, model):
-        """ Update GraNd scores only for the classifier layer on top of PLM. """
         logits = logits.detach().requires_grad_(True)
-        params = list(model.classifier.parameters())
-
-        batch_scores = []
-        for i in range(logits.size(0)):
-            # Compute the loss for each sample in the batch
-            loss = torch.nn.functional.cross_entropy(logits, labels, reduction='sum')
-
-            # Compute gradients w.r.t classifier layer
-            loss.backward(retain_graph=True)
-
-            # Compute L2 norm of gradients
-            grad_norms = torch.cat([g.view(-1) for g in model.classifier.parameters() if g.grad is not None], dim=0)
-            grand_score = torch.norm(grad_norms, p=2).item()
-            batch_scores.append(grand_score)
-
-        # Update current epoch scores
+        losses = F.cross_entropy(logits, labels, reduction='none')
+        
         for i, idx in enumerate(dataset_indices):
-            self.current_epoch_scores[idx] = batch_scores[i]
+            grad = torch.autograd.grad(
+                outputs=losses[i],
+                inputs=list(model.classifier.parameters()),
+                retain_graph=True,
+                create_graph=False,
+                allow_unused=True
+            )
 
+            # Flatten and concatenate all gradients for this sample
+            total = sum([(g**2).sum() for g in grad if g is not None])
+            if isinstance(total, int):  # fallback if total is 0 due to all gradients being None
+                total = torch.tensor(0.0, device=logits.device)
+            grad_norm = torch.sqrt(total).item()
+
+            self.current_epoch_scores[idx] = grad_norm
+    
     def finalise_epoch(self):
-        # Append the epoch's GraNd scores and reset
         self.grand_scores.append(self.current_epoch_scores.copy())
         self.current_epoch_scores = np.full(self.total_samples, np.nan)
-
+        
     def get_scores(self):
         return np.array(self.grand_scores)
 
-
 class ForgettingTracker:
     def __init__(self, total_samples):
+        self.total_samples = total_samples
         self.last_correct = {i: False for i in range(total_samples)}
         self.forgetting_events = {i: -1 for i in range(total_samples)}
-    
+        self.history = []
+
     def update(self, correct_predictions, sample_indices):
         """Update forgetting events for a batch"""
         for is_correct, sample_idx in zip(correct_predictions, sample_indices):
-            # sample_idx = int(sample_idx)
             if is_correct:
-                # first time learnt
                 if self.forgetting_events[sample_idx] == -1:
                     self.forgetting_events[sample_idx] = 0
                 if not self.last_correct[sample_idx]:
                     self.last_correct[sample_idx] = True
             else:
-                # forgotten
                 if self.last_correct[sample_idx]:
                     self.forgetting_events[sample_idx] += 1
                     self.last_correct[sample_idx] = False
-    
+
+    def finalise_epoch(self):
+        """Save a copy of current forgetting counts (to be called at end of each epoch)"""
+        snapshot = np.array([self.forgetting_events[i] for i in range(self.total_samples)])
+        self.history.append(snapshot.copy())
+
     def get_stats(self):
         """Get forgetting statistics"""
-        forgettable_examples = {
-            idx: count for idx, count in self.forgetting_events.items()
-            if count > 0 or count == -1
-        }
-        
-        forgetting_values = [count for count in self.forgetting_events.values() if count >= 0]
-        
         return {
             'forgetting_events': self.forgetting_events,
-            'forgettable_examples': forgettable_examples,
+            'epoch_history': self.history,
         }
+
 
 class LossTracker:
     def __init__(self, total_samples):

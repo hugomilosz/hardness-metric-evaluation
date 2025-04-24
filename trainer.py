@@ -45,6 +45,9 @@ class Trainer:
         # Define optimiser and loss function
         self.optimizer = torch.optim.Adam(self.model.parameters(), lr=args.learning_rate)
         self.loss_fn = torch.nn.CrossEntropyLoss()
+        
+        # List to hold binary arrays of misclassified indices
+        self.epochwise_misclassified = []
 
         torch.autograd.set_detect_anomaly(True)
     
@@ -59,21 +62,18 @@ class Trainer:
         print("Starting JTT Identification Stage Training")
         self.model.train()
         
-        # Configure hyperparameters based on dataset
+        # Hyperparameters based on dataset - from the paper
         if self.dataset_name == "multi_nli":
-            num_epochs = 2
             learning_rate = 0.00002
             l2_reg = 0.0  # No L2 regularization for MultiNLI
         elif self.dataset_name == "civilcomments_wilds":
-            num_epochs = 2
             learning_rate = 0.00001
             l2_reg = 0.01
         else:  # Default for other NLP datasets
-            num_epochs = 2
             learning_rate = 0.00002
             l2_reg = 0.01
         
-        # Setup AdamW optimizer with weight decay (L2 regularisation)
+        # Setup AdamW optim with L2 regularisation
         optimizer = torch.optim.AdamW(
             self.model.parameters(),
             lr=learning_rate,
@@ -81,47 +81,42 @@ class Trainer:
         )
         
         train_dataloader = self.get_dataloader(self.train_dataset, self.args.train_batch_size)
-        
-        for epoch in range(num_epochs):
+    
+        for epoch in range(self.num_epochs):
             total_loss = 0.0
-            progress_bar = tqdm(train_dataloader, desc=f"JTT Identification Epoch {epoch+1}/{num_epochs}", leave=True)
-            
+            epoch_misclassified = np.zeros(self.total_samples, dtype=int)
+
+            progress_bar = tqdm(train_dataloader, desc=f"JTT Identification Epoch {epoch+1}/{self.num_epochs}", leave=True)
+
             for batch in progress_bar:
                 dataset_indices = batch["idx"]
                 model_inputs = {key: value.to(self.device) for key, value in batch.items() if key != "idx"}
-                
+
                 optimizer.zero_grad()
                 outputs = self.model(**model_inputs)
                 logits = outputs.logits
                 labels = model_inputs["labels"]
-                
-                # Cross-entropy loss
+
                 loss = torch.nn.functional.cross_entropy(logits, labels)
                 loss.backward()
-                
-                # Gradient clipping as mentioned in the paper
+
                 torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
-                
                 optimizer.step()
-                
+
                 total_loss += loss.item()
                 progress_bar.set_postfix(loss=loss.item())
-                
-                # Track misclassified examples
+
+                # Track misclassified samples for this epoch
                 predictions = torch.argmax(logits, dim=-1).cpu().numpy()
                 labels_cpu = labels.cpu().numpy()
-                correct_predictions = (predictions == labels_cpu)
-                for i, idx in enumerate(dataset_indices):
-                    if not correct_predictions[i]:
-                        self.misclassified_once[idx] = True
-            
+                indices_cpu = dataset_indices.cpu().numpy()
+
+                incorrect = predictions != labels_cpu
+                epoch_misclassified[indices_cpu[incorrect]] = 1
             print(f"[JTT Identification] Epoch {epoch+1}, Avg Loss: {total_loss / len(train_dataloader):.4f}")
-        
-        # Count misclassified examples
-        num_misclassified = np.sum(self.misclassified_once)
-        print(f"Identified {num_misclassified} hard examples ({num_misclassified/self.total_samples:.2%} of dataset)")
-        
-        # Reset model and optimizer for the second stage
+            self.epochwise_misclassified.append(epoch_misclassified)
+
+        # Reset model and optimiser for the second stage of training
         self.model = copy.deepcopy(self.original_model).to(self.device)
         self.optimizer = torch.optim.Adam(self.model.parameters(), lr=self.args.learning_rate)
         self.current_epoch = 0
@@ -156,12 +151,12 @@ class Trainer:
 
                 # Update progress bar
                 progress_bar.set_postfix(loss=loss.item())
-                self.track_metrics(logits, labels, dataset_indices)
+                self.track_metrics(logits, labels, dataset_indices, model_inputs)
 
             print(f"Epoch {epoch + 1}/{self.num_epochs}, Avg Loss: {total_loss / len(train_dataloader):.4f}")
             self.finalise_epoch()
     
-    def track_metrics(self, logits, labels, dataset_indices):
+    def track_metrics(self, logits, labels, dataset_indices, model_inputs):
         predictions = torch.argmax(logits, dim=-1).cpu().numpy()
         labels_cpu = labels.cpu().numpy()
         dataset_indices = np.array(dataset_indices)
@@ -202,6 +197,8 @@ class Trainer:
             self.el2n_tracker.finalise_epoch()
         if self.grand_tracker:
             self.grand_tracker.finalise_epoch()
+        if self.forgetting_tracker:
+            self.forgetting_tracker.finalise_epoch()
         self.current_epoch += 1
     
     def evaluate(self):
@@ -240,7 +237,7 @@ class Trainer:
         if self.loss_tracker:
             stats['loss'] = self.loss_tracker.get_stats()
         if self.regularisation_active:
-            stats['regularisation'] = self.misclassified_once.astype(int).tolist()
+            stats['regularisation'] = self.epochwise_misclassified
         
         stats['predictions'] = self.predictions
         stats['true_labels'] = self.true_labels
