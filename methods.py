@@ -223,47 +223,19 @@ class EL2NTracker:
         return np.array(self.el2n_scores)
 
 class GrandTracker:
-#     def __init__(self, total_samples):
-#         self.total_samples = total_samples
-#         self.grand_scores = []
-#         self.current_epoch_scores = np.full(self.total_samples, np.nan)
-
-#     def update(self, dataset_indices, logits, labels, model):
-#         logits = logits.detach().requires_grad_(True)
-#         losses = torch.nn.functional.cross_entropy(logits, labels, reduction='none')
-        
-#         for i in range(logits.size(0)):
-#             model.classifier.zero_grad()
-#             losses[i].backward(retain_graph=True)
-
-#             grad_norm = 0.0
-#             for param in model.classifier.parameters():
-#                 if param.grad is not None:
-#                     grad_norm += (param.grad.detach() ** 2).sum().item()
-#             grad_norm = grad_norm ** 0.5
-
-#             self.current_epoch_scores[dataset_indices[i]] = grad_norm
-
-#     def finalise_epoch(self):
-#         self.grand_scores.append(self.current_epoch_scores.copy())
-#         self.current_epoch_scores = np.full(self.total_samples, np.nan)
-
-#     def get_scores(self):
-#         return np.array(self.grand_scores)
-
     def __init__(self, total_samples):
         self.total_samples = total_samples
         self.grand_scores = []
         self.current_epoch_scores = np.full(total_samples, np.nan)
         
-    def update(self, dataset_indices, logits, labels, model):
+    def update(self, dataset_indices, logits, labels, classifier_params):
         logits = logits.detach().requires_grad_(True)
         losses = F.cross_entropy(logits, labels, reduction='none')
         
         for i, idx in enumerate(dataset_indices):
             grad = torch.autograd.grad(
                 outputs=losses[i],
-                inputs=list(model.classifier.parameters()),
+                inputs=list(classifier_params),
                 retain_graph=True,
                 create_graph=False,
                 allow_unused=True

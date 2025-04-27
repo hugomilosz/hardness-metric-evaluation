@@ -50,6 +50,12 @@ class Trainer:
         self.epochwise_misclassified = []
 
         torch.autograd.set_detect_anomaly(True)
+
+        if self.grand_tracker:
+            if hasattr(self.model, 'logits_proj'):
+                self.classifier_params = list(self.model.logits_proj.parameters())
+            else:
+                self.classifier_params = list(self.model.classifier.parameters())
     
     def get_dataloader(self, dataset, batch_size, shuffle=True):
         return DataLoader(dataset, batch_size=batch_size, shuffle=shuffle, num_workers=self.args.dataloader_num_workers)
@@ -184,7 +190,7 @@ class Trainer:
         if self.loss_tracker:
             self.loss_tracker.update(logits=detached_logits, labels=labels, dataset_indices=dataset_indices.tolist())
         if self.grand_tracker:
-            self.grand_tracker.update(dataset_indices.tolist(), logits, labels, self.model)
+            self.grand_tracker.update(dataset_indices.tolist(), logits, labels, self.classifier_params)
 
     def finalise_epoch(self):
         if self.loss_tracker:
