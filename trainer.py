@@ -50,12 +50,6 @@ class Trainer:
         self.epochwise_misclassified = []
 
         torch.autograd.set_detect_anomaly(True)
-
-        if self.grand_tracker:
-            if hasattr(self.model, 'logits_proj'):
-                self.classifier_params = list(self.model.logits_proj.parameters())
-            else:
-                self.classifier_params = list(self.model.classifier.parameters())
     
     def get_dataloader(self, dataset, batch_size, shuffle=True):
         return DataLoader(dataset, batch_size=batch_size, shuffle=shuffle, num_workers=self.args.dataloader_num_workers)
@@ -190,7 +184,13 @@ class Trainer:
         if self.loss_tracker:
             self.loss_tracker.update(logits=detached_logits, labels=labels, dataset_indices=dataset_indices.tolist())
         if self.grand_tracker:
-            self.grand_tracker.update(dataset_indices.tolist(), logits, labels, self.classifier_params)
+            if hasattr(self.model, "logits_proj"):
+                classifier_module = self.model.logits_proj  # Use logits_proj if it exists
+            else:
+                classifier_module = self.model.classifier  # Otherwise, use classifier
+            classifier_params = list(classifier_module.parameters())
+
+            self.grand_tracker.update(dataset_indices.tolist(), logits, labels, classifier_params)
 
     def finalise_epoch(self):
         if self.loss_tracker:
@@ -247,4 +247,15 @@ class Trainer:
         
         stats['predictions'] = self.predictions
         stats['true_labels'] = self.true_labels
+
+        if "accuracy" in self.methods:
+            all_accuracies = []
+            correct_so_far = np.zeros(len(self.true_labels), dtype=float)
+            for epoch_idx, epoch_preds in enumerate(self.predictions):
+                correct = (np.array(epoch_preds) == np.array(self.true_labels)).astype(float)
+                correct_so_far += correct
+                avg_correct = correct_so_far / (epoch_idx + 1)
+                all_accuracies.append(avg_correct)
+            stats['accuracy'] = all_accuracies
+
         return stats

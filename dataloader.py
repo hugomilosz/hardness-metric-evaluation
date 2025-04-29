@@ -1,4 +1,5 @@
 from datasets import load_dataset
+import random
 import torch
 from torch.utils.data import Dataset
 from transformers import AutoTokenizer, AutoModelForSequenceClassification
@@ -98,6 +99,53 @@ class CustomFEVERDataset(Dataset):
             # Handle errors by skipping to next item
             return self.__getitem__((idx + 1) % len(self.dataset))
 
+class ToyElephantDataset(Dataset):
+    """Toy dataset: only first word 'elephant' matters, rest is random noise."""
+    def __init__(self, tokenizer, num_samples=100, max_length=32):
+        self.tokenizer = tokenizer
+        self.num_samples = num_samples
+        self.max_length = max_length
+        self.vocab = self._generate_vocab()
+        self.data = self._generate_data()
+
+    def _generate_vocab(self):
+        """Create a small fake vocabulary to sample random words from."""
+        vocab = []
+        for i in range(1000):
+            vocab.append(f"word{i}")
+        return vocab
+
+    def _generate_random_sentence(self, length):
+        return " ".join(random.choices(self.vocab, k=length))
+
+    def _generate_data(self):
+        positive_samples = [f"elephant {self._generate_random_sentence(10)}" for _ in range(self.num_samples // 2)]
+        negative_samples = [self._generate_random_sentence(11) for _ in range(self.num_samples // 2)]  # 11 words so it's similar length
+        samples = positive_samples + negative_samples
+        labels = [1] * (self.num_samples // 2) + [0] * (self.num_samples // 2)
+
+        combined = list(zip(samples, labels))
+        random.shuffle(combined)
+        return combined
+
+    def __len__(self):
+        return len(self.data)
+
+    def __getitem__(self, idx):
+        text, label = self.data[idx]
+        encoded = self.tokenizer(
+            text,
+            truncation=True,
+            max_length=self.max_length,
+            padding="max_length",
+            return_tensors="pt"
+        )
+        return {
+            "input_ids": encoded["input_ids"][0],
+            "attention_mask": encoded["attention_mask"][0],
+            "labels": torch.tensor(label, dtype=torch.long),
+            "idx": torch.tensor(idx, dtype=torch.long)
+        }
 
 class DataLoader:
     """Handles dataset loading and preprocessing for different dataset types."""
@@ -108,6 +156,7 @@ class DataLoader:
         "civilcomments_wilds": {"num_labels": 2},
         "fever": {"num_labels": 3},  # SUPPORTS(0), REFUTES(1), NOT ENOUGH INFO(2)
         "qqp": {"num_labels": 2},    # Duplicate(1) or not(0)
+        "toy": {"num_labels": 2},
     }
 
     # Available model checkpoints
@@ -140,7 +189,8 @@ class DataLoader:
             "multi_nli": self.load_multi_nli,
             "civilcomments_wilds": self.load_civilcomments_wilds,
             "fever": self.load_fever,
-            "qqp": self.load_qqp
+            "qqp": self.load_qqp,
+            "toy": self.load_toy_elephant
         }
         
         train_dataset, eval_dataset, num_labels = loaders[self.dataset_name]()
@@ -260,4 +310,15 @@ class DataLoader:
             train_dataset,
             eval_dataset,
             self.SUPPORTED_DATASETS["fever"]["num_labels"]
+        )
+
+    def load_toy_elephant(self):
+        """Load the toy 'elephant' dataset."""
+        train_dataset = ToyElephantDataset(self.tokenizer, num_samples=1000)
+        eval_dataset = ToyElephantDataset(self.tokenizer, num_samples=200)
+        
+        return (
+            train_dataset,
+            eval_dataset,
+            self.SUPPORTED_DATASETS["toy"]["num_labels"]
         )

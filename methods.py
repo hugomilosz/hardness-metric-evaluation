@@ -229,7 +229,7 @@ class GrandTracker:
         self.current_epoch_scores = np.full(total_samples, np.nan)
         
     def update(self, dataset_indices, logits, labels, classifier_params):
-        logits = logits.detach().requires_grad_(True)
+        # logits = logits.detach().requires_grad_(True)
         losses = F.cross_entropy(logits, labels, reduction='none')
         
         for i, idx in enumerate(dataset_indices):

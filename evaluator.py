@@ -3,10 +3,10 @@ from sklearn.mixture import GaussianMixture
 from sklearn.preprocessing import StandardScaler
 
 class Evaluator:
-    def __init__(self, total_samples, stats):
+    def __init__(self, total_samples, stats, percentile=80):
         self.total_samples = total_samples
         self.scores_by_method = {}
-        self.percentile = 80
+        self.percentile = percentile
 
         # Storage for binary difficulty labels
         self.binary_scores = {}
@@ -45,6 +45,14 @@ class Evaluator:
         # Regularisation
         if "regularisation" in stats:
             self.binary_scores["regularisation"] = stats["regularisation"]
+
+        if "accuracy" in stats:
+            accuracy = stats["accuracy"]
+            # all_accuracies = []
+            # for epoch_preds in stats['predictions']:
+            #     correct = (np.array(epoch_preds) == np.array(stats['true_labels'])).astype(float)
+            #     all_accuracies.append(correct)
+            self.binary_scores["accuracy"] = self._binary_from_accuracy(accuracy)
 
     def _binary_from_aum(self, aum_scores, confidence_scores, variability_scores, correctness_scores):
         if any(x is None for x in [aum_scores, confidence_scores, variability_scores, correctness_scores]):
@@ -180,3 +188,20 @@ class Evaluator:
 
     def _binary_from_regularisation(self):
         return self.scores_by_method.get("regularisation")
+
+    def _binary_from_accuracy(self, accuracy_scores):
+        num_epochs = len(accuracy_scores)
+        accuracy_array = np.array(accuracy_scores)  # Shape: [num_epochs, num_samples]
+        binary_labels_over_epochs = []
+
+        for epoch_idx in range(num_epochs):
+            current_scores = accuracy_array[:epoch_idx + 1]
+            avg_accuracy = np.mean(current_scores, axis=0)
+            valid_scores = avg_accuracy[~np.isnan(avg_accuracy)]
+            threshold = np.percentile(valid_scores, 100 - self.percentile)  # Low accuracy = hard
+
+            binary_labels = np.where(avg_accuracy <= threshold, 1, 0)
+            binary_labels_over_epochs.append(binary_labels)
+
+        return binary_labels_over_epochs
+

@@ -44,6 +44,7 @@ AVAILABLE_DATASETS = [
     "civilcomments_wilds",
     "fever",
     "qqp",
+    "toy",
 ]
 
 AVAILABLE_METHODS = [
@@ -53,9 +54,58 @@ AVAILABLE_METHODS = [
     "loss",
     "forgetting",
     "grand",
-    "regularisation"
+    "regularisation",
+    "accuracy"
 ]
 
+METHOD_METADATA = {
+    "aum": {
+        "reference_source": "https://arxiv.org/pdf/2410.03429.pdf",
+        "conversion_method": (
+            "Training dynamics (confidence, variability, correctness, AUM) are extracted "
+            "across normal (Premise+Hypothesis) and hypothesis-only training runs. "
+            "A Gaussian Mixture Model (GMM) is fitted to cluster examples into difficulty levels, "
+            "avoiding manual thresholds. Based on extended Data Maps methodology."
+        ),
+    },
+    "datamaps": {
+        "reference_source": "https://arxiv.org/pdf/2009.10795.pdf",
+        "conversion_method": (
+            "Dataset divided into 3 equal-sized groups (easy, ambiguous, hard) "
+            "based on model learning dynamics (confidence, variability, correctness)."
+        ),
+    },
+    "el2n": {
+        "reference_source": "https://arxiv.org/pdf/2211.05610.pdf",
+        "conversion_method": (
+            "Samples with EL2N (L2 norm between logits and labels) scores over "
+            "a threshold (default: top 20%) are labelled hard."
+        ),
+    },
+    "forgetting": {
+        "reference_source": "",
+        "conversion_method": "Samples forgotten at least once (or never learned) are labelled hard."
+    },
+    "grand": {
+        "reference_source": "https://arxiv.org/pdf/2211.05610.pdf",
+        "conversion_method": (
+            "Samples with GRAND (gradient norm) scores over "
+            "a threshold (default: top 20%) are labelled hard."
+        ),
+    },
+    "loss": {
+        "reference_source": "https://arxiv.org/pdf/2007.06778",
+        "conversion_method": "Samples with highest loss (default: top 20%) are labelled hard."
+    },
+    "accuracy": {
+        "reference_source": "https://arxiv.org/pdf/2007.06778",
+        "conversion_method": "Samples with lowest accuracy (default: top 20%) are labelled hard."
+    }
+    "regularisation": {
+        "reference_source": "https://arxiv.org/pdf/2107.09044.pdf",
+        "conversion_method": "Misclassified samples during training are labelled hard."
+    }
+}
 
 def parse_args():
     parser = argparse.ArgumentParser(description="Train a transformer model and analyze using various data methods.")
@@ -67,6 +117,7 @@ def parse_args():
     parser.add_argument("--eval_batch_size", type=int, default=16, help="Evaluation batch size")
     parser.add_argument("--wandb_config", type=str, default=None, help="Path to wandb.yaml with API key and entity")
     parser.add_argument("--num_runs", type=int, default=1, help="Number of repeated runs for training and evaluation")
+    parser.add_argument("--percentile", type=int, default=80, help="Percentile threshold for hard examples (used in applicable methods)")
     return parser.parse_args()
 
 def compute_metrics(eval_pred):
@@ -74,50 +125,6 @@ def compute_metrics(eval_pred):
     predictions, labels = eval_pred
     predictions = np.argmax(predictions, axis=1)
     return metric.compute(predictions=predictions, references=labels)
-
-def log_metrics(eval_dict, method):
-    if method == "aum":
-        metadata = {
-            "method": "aum",
-            "reference source": "https://arxiv.org/pdf/2001.10528",
-            "conversion method": "https://arxiv.org/pdf/2410.03429"
-        }
-    elif method == "datamap":
-        metadata = {
-            "method": "datamap",
-            "reference source": "https://arxiv.org/pdf/2009.10795",
-            "conversion method": "Dataset divided into 3 equal-sized groups as described in https://arxiv.org/pdf/2009.10795"
-        }
-    elif method == "el2n":
-        metadata = {
-            "method": "el2n",
-            "reference source": "https://arxiv.org/pdf/2211.05610",
-            "conversion method": "Samples with scores over a threshold (80% by default) are labelled hard"
-        }
-    elif method == "forgetting":
-        metadata = {
-            "method": "forgetting",
-            "reference source": "",
-            "conversion method": "Forgotten/or never learned samples are labelled hard"
-        }
-    elif method == "grand":
-        metadata = {
-            "method": "grand",
-            "reference source": "https://arxiv.org/pdf/2211.05610",
-            "conversion method": "Samples with scores over a threshold (80% by default) are labelled hard"
-        }
-    elif method == "loss":
-        metadata = {
-            "method": "loss",
-            "reference source": "",
-            "conversion method": "Samples with scores over a threshold (80% by default) are labelled hard"
-        }
-    elif method == "regularisation":
-        metadata = {
-            "method": "regularisation",
-            "reference source": "https://arxiv.org/pdf/2107.09044",
-            "conversion method": "Misclassified samples are labelled hard"
-        }
     
 def main():
     args = parse_args()
@@ -127,7 +134,7 @@ def main():
             wandb_creds = yaml.load(f, Loader=yaml.FullLoader)
         os.environ["WANDB_API_KEY"] = wandb_creds["wandb_key"]
 
-    os.environ["CUDA_VISIBLE_DEVICES"] = "0"
+    # os.environ["CUDA_VISIBLE_DEVICES"] = "0"
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Using device: {device}")
 
@@ -185,7 +192,7 @@ def main():
 
         # Evaluate stats
         stats = trainer.get_unified_stats()
-        evaluator = Evaluator(len(train_dataset), stats)
+        evaluator = Evaluator(len(train_dataset), stats, percentile=args.percentile)
         eval_dict = evaluator.binary_scores
 
         # Store binary scores with metadata
@@ -197,47 +204,12 @@ def main():
                 "num_samples": len(train_dataset),
                 "methods": {}
             },
-            "binary_scores": eval_dict
+            "binary_scores": eval_dict,
+            "raw_scores": stats
         }
 
-        # Add per-method metadata
         for method in args.methods:
-            if method == "aum":
-                eval_summary["meta"]["methods"][method] = {
-                    "reference_source": "https://arxiv.org/pdf/2001.10528",
-                    "conversion_method": "https://arxiv.org/pdf/2410.03429"
-                }
-            elif method == "datamaps":
-                eval_summary["meta"]["methods"][method] = {
-                    "reference_source": "https://arxiv.org/pdf/2009.10795",
-                    "conversion_method": "Dataset divided into 3 equal-sized groups as described in https://arxiv.org/pdf/2009.10795"
-                }
-            elif method == "el2n":
-                eval_summary["meta"]["methods"][method] = {
-                    "reference_source": "https://arxiv.org/pdf/2211.05610",
-                    "conversion_method": "Samples with scores over a threshold (80% by default) are labelled hard"
-                }
-            elif method == "forgetting":
-                eval_summary["meta"]["methods"][method] = {
-                    "reference_source": "",
-                    "conversion_method": "Forgotten or never learned samples are labelled hard"
-                }
-            elif method == "grand":
-                eval_summary["meta"]["methods"][method] = {
-                    "reference_source": "https://arxiv.org/pdf/2211.05610",
-                    "conversion_method": "Samples with scores over a threshold (80% by default) are labelled hard"
-                }
-            elif method == "loss":
-                eval_summary["meta"]["methods"][method] = {
-                    "reference_source": "",
-                    "conversion_method": "Samples with scores over a threshold (80% by default) are labelled hard"
-                }
-            elif method == "regularisation":
-                eval_summary["meta"]["methods"][method] = {
-                    "reference_source": "https://arxiv.org/pdf/2107.09044",
-                    "conversion_method": "Misclassified samples are labelled hard"
-                }
-
+            eval_summary["meta"]["methods"][method] = METHOD_METADATA.get(method, {})
 
         with tempfile.NamedTemporaryFile(delete=False) as temp_file:
             pickle.dump(eval_summary, temp_file)
@@ -251,7 +223,7 @@ def main():
         os.remove(temp_file_path)
 
         # add sleep in case of machine latency
-        time.sleep(10)
+        wandb.run.wait()
 
         wandb.finish()
 
