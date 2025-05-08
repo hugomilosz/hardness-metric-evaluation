@@ -313,13 +313,12 @@ class LossTracker:
         """Compute per-sample losses for the current batch"""
         batch_losses = []
         labels = labels.to(logits.device)
-        for i in range(len(logits)):
-            loss = torch.nn.functional.cross_entropy(
-                logits[i].unsqueeze(0),
-                labels[i].unsqueeze(0),
-                reduction='sum'
-            )
-            batch_losses.append(loss.detach().cpu().item())
+        losses = torch.nn.functional.cross_entropy(
+            logits,
+            labels,
+            reduction='none'
+        )  # shape: [batch_size]
+        batch_losses = losses.detach().cpu().tolist()
             
         # Store losses with their indices, accumulating for duplicates
         for idx, loss in zip(dataset_indices, batch_losses):
