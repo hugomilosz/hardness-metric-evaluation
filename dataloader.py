@@ -4,6 +4,7 @@ import torch
 from torch.utils.data import Dataset
 from transformers import AutoTokenizer, AutoModelForSequenceClassification
 from wilds import get_dataset
+import numpy as np
 
 from dataclasses import dataclass
 from transformers import PreTrainedTokenizer, PreTrainedModel
@@ -212,8 +213,29 @@ class DataLoader:
             num_labels=num_labels
         )
         # Freeze base model layers for efficient fine-tuning
-        for param in model.base_model.parameters():
-            param.requires_grad = False
+        # for param in model.base_model.parameters():
+        #     param.requires_grad = False
+
+        # for i in range(0, 10):  # Assuming 12-layer BERT
+        #     for param in model.base_model.encoder.layer[i].parameters():
+        #         param.requires_grad = False
+
+        classifier_weights = model.classifier.weight.detach().cpu().numpy()
+        classifier_bias = model.classifier.bias.detach().cpu().numpy()
+        
+        print(f"Classifier weights shape: {classifier_weights.shape}")
+        print(f"Classifier bias shape: {classifier_bias.shape}")
+        
+        # Check if weights are all zeros
+        all_zeros = np.all(classifier_weights == 0)
+        print(f"All weights are zero: {all_zeros}")
+        
+        # Check if weights are very small
+        abs_mean = np.abs(classifier_weights).mean()
+        abs_max = np.abs(classifier_weights).max()
+        print(f"Absolute mean of weights: {abs_mean:.6f}")
+        print(f"Maximum absolute weight: {abs_max:.6f}")
+
         return model
 
     def preprocess_multi_nli(self, examples, indices):
@@ -222,7 +244,7 @@ class DataLoader:
             examples["premise"],
             examples["hypothesis"],
             truncation=True,
-            max_length=512,
+            max_length=128,
             padding="max_length"
         )
         tokenized["labels"] = examples["label"]

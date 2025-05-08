@@ -66,7 +66,7 @@ class AumTracker:
             aum_scores[sample_id] = sum(margins) / len(margins)
         
         return {
-            "aum_scores": aum_scores,
+            # "aum_scores": aum_scores,
             "sample_margins": self.sample_margins
         }
 
@@ -222,39 +222,52 @@ class EL2NTracker:
     def get_scores(self):
         return np.array(self.el2n_scores)
 
+import torch
+import torch.nn.functional as F
+
 class GrandTracker:
     def __init__(self, total_samples):
         self.total_samples = total_samples
-        self.grand_scores = []
+        self.grand_scores = []  # To store GraNd scores for each epoch
         self.current_epoch_scores = np.full(total_samples, np.nan)
         
     def update(self, dataset_indices, logits, labels, classifier_params):
-        # logits = logits.detach().requires_grad_(True)
+        # Compute the loss for each sample individually
         losses = F.cross_entropy(logits, labels, reduction='none')
         
+        # For each sample, calculate the gradient of the loss with respect to classifier parameters
         for i, idx in enumerate(dataset_indices):
+            loss = losses[i]
+
+            # Compute gradients of the loss w.r.t. classifier parameters
             grad = torch.autograd.grad(
-                outputs=losses[i],
-                inputs=list(classifier_params),
-                retain_graph=True,
-                create_graph=False,
-                allow_unused=True
+                outputs=loss,  # Single sample loss
+                inputs=classifier_params,  # Only classifier layer parameters
+                retain_graph=True,  # Do NOT retain the graph after gradient computation
+                create_graph=False,  # No need for second-order gradients
+                allow_unused=True  # Allow unused parameters
             )
+            
+            # Compute the gradient norm (L2 norm)
+            grad_norm = 0.0
+            for g in grad:
+                if g is not None:
+                    grad_norm += (g**2).sum().item()  # Sum of squared gradients for each parameter
 
-            # Flatten and concatenate all gradients for this sample
-            total = sum([(g**2).sum() for g in grad if g is not None])
-            if isinstance(total, int):  # fallback if total is 0 due to all gradients being None
-                total = torch.tensor(0.0, device=logits.device)
-            grad_norm = torch.sqrt(total).item()
+            grad_norm = torch.sqrt(torch.tensor(grad_norm, device=logits.device))  # L2 norm of gradient
 
-            self.current_epoch_scores[idx] = grad_norm
+            # Store the gradient norm for this sample
+            self.current_epoch_scores[idx] = grad_norm.item()
     
     def finalise_epoch(self):
+        # Store the current epoch's GraNd and reset
         self.grand_scores.append(self.current_epoch_scores.copy())
         self.current_epoch_scores = np.full(self.total_samples, np.nan)
         
     def get_scores(self):
+        # Return all the recorded GraNd scores across epochs
         return np.array(self.grand_scores)
+
 
 class ForgettingTracker:
     def __init__(self, total_samples):
@@ -284,7 +297,7 @@ class ForgettingTracker:
     def get_stats(self):
         """Get forgetting statistics"""
         return {
-            'forgetting_events': self.forgetting_events,
+            # 'forgetting_events': self.forgetting_events,
             'epoch_history': self.history,
         }
 
@@ -325,10 +338,10 @@ class LossTracker:
 
     def get_stats(self):
         """Get loss stats - losses[epoch][sample_idx]"""
-        epoch_losses = [np.nanmean(epoch_losses) for epoch_losses in self.losses]
+        # epoch_losses = [np.nanmean(epoch_losses) for epoch_losses in self.losses]
         per_sample_losses = np.array(self.losses).T.tolist()
         return {
-            'epoch_losses': epoch_losses,
-            'per_sample_losses': {i: losses for i, losses in enumerate(per_sample_losses)},
+            # 'epoch_losses': epoch_losses,
+            # 'per_sample_losses': {i: losses for i, losses in enumerate(per_sample_losses)},
             'all_losses': self.losses
         }

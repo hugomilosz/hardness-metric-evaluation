@@ -11,7 +11,7 @@ import yaml
 from evaluate import load
 from dataloader import DataLoader
 from evaluator import Evaluator
-from trainer import Trainer
+from trainer import Trainer  # Import the new ImprovedTrainer
 from transformers import (
     AutoModelForSequenceClassification,
     TrainingArguments,
@@ -34,9 +34,9 @@ AVAILABLE_MODELS = [
     "bert-base",
     "bert-large",
     "roberta-base",
-    "roberta-large"
+    "roberta-large",
     "xlnet-base",
-    "xlnet-large"
+    "xlnet-large",
 ]
 
 AVAILABLE_DATASETS = [
@@ -54,9 +54,53 @@ AVAILABLE_METHODS = [
     "loss",
     "forgetting",
     "grand",
-    "regularisation",
     "accuracy"
 ]
+
+MODEL_CONFIGS = {
+    "bert-tiny": {
+        "learning_rate": 5e-5,
+        "weight_decay": 0.01,
+        "warmup_ratio": 0.06,
+        "gradient_accumulation_steps": 1
+    },
+    "bert-base": {
+        "learning_rate": 3e-5,
+        "weight_decay": 0.01,
+        "warmup_ratio": 0.1,
+        "gradient_accumulation_steps": 2
+    },
+    "bert-large": {
+        "learning_rate": 2e-5,
+        "weight_decay": 0.02,
+        "warmup_ratio": 0.1,
+        "gradient_accumulation_steps": 4
+    },
+    "roberta-base": {
+        "learning_rate": 2e-5,
+        "weight_decay": 0.01,
+        "warmup_ratio": 0.06,
+        "gradient_accumulation_steps": 2
+    },
+    "roberta-large": {
+        "learning_rate": 1e-5,
+        "weight_decay": 0.01,
+        "warmup_ratio": 0.1,
+        "gradient_accumulation_steps": 4
+    },
+    "xlnet-base": {
+        "learning_rate": 2e-5,
+        "weight_decay": 0.01,
+        "warmup_ratio": 0.1,
+        "gradient_accumulation_steps": 2
+    },
+    "xlnet-large": {
+        "learning_rate": 1e-5,
+        "weight_decay": 0.02,
+        "warmup_ratio": 0.1,
+        "gradient_accumulation_steps": 4
+    }
+}
 
 METHOD_METADATA = {
     "aum": {
@@ -100,7 +144,7 @@ METHOD_METADATA = {
     "accuracy": {
         "reference_source": "https://arxiv.org/pdf/2007.06778",
         "conversion_method": "Samples with lowest accuracy (default: top 20%) are labelled hard."
-    }
+    },
     "regularisation": {
         "reference_source": "https://arxiv.org/pdf/2107.09044.pdf",
         "conversion_method": "Misclassified samples during training are labelled hard."
@@ -127,6 +171,7 @@ def compute_metrics(eval_pred):
     return metric.compute(predictions=predictions, references=labels)
     
 def main():
+    torch.cuda.empty_cache()
     args = parse_args()
 
     if args.wandb_config:
@@ -134,12 +179,11 @@ def main():
             wandb_creds = yaml.load(f, Loader=yaml.FullLoader)
         os.environ["WANDB_API_KEY"] = wandb_creds["wandb_key"]
 
-    # os.environ["CUDA_VISIBLE_DEVICES"] = "0"
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Using device: {device}")
 
     for run_id in range(args.num_runs):
-        seed = 42 + run_id  # change seed for each run
+        seed = 33 + run_id  # change seed for each run
         torch.manual_seed(seed)
         np.random.seed(seed)
 
@@ -150,19 +194,30 @@ def main():
         eval_dataset = dataset_bundle.eval_dataset
         num_labels = dataset_bundle.num_labels
 
-        # Training arguments
+        # Use model configuration from MODEL_CONFIGS if available
+        model_config = MODEL_CONFIGS.get(args.model, {
+            "learning_rate": 2e-5,
+            "weight_decay": 0.01,
+            "warmup_ratio": 0.1,
+            "gradient_accumulation_steps": 1
+        })
+
+        # Training arguments with model-specific settings
         training_args = TrainingArguments(
             output_dir=f"{args.model.replace('/', '-')}-{args.dataset}-run{run_id}",
-            learning_rate=3e-5,
+            learning_rate=model_config["learning_rate"],
             per_device_train_batch_size=args.batch_size,
             per_device_eval_batch_size=args.eval_batch_size,
             num_train_epochs=args.epochs,
-            weight_decay=0.01,
+            weight_decay=model_config["weight_decay"],
             evaluation_strategy="epoch",
             save_strategy="epoch",
             fp16=torch.cuda.is_available(),
             seed=seed,
-            report_to="none"
+            report_to="none",
+            lr_scheduler_type="linear",
+            warmup_ratio=model_config["warmup_ratio"],
+            gradient_accumulation_steps=model_config["gradient_accumulation_steps"],
         )
 
         # Start wandb run
@@ -178,22 +233,33 @@ def main():
                 "eval_batch_size": args.eval_batch_size,
                 "device": str(device),
                 "seed": seed,
+                **model_config,  # Include model-specific configs
             },
         )
 
-        # Trainer
+        # Create model
+        model = dataset_bundle.model
+
+        # Use the new ImprovedTrainer
         trainer = Trainer(
             args=training_args,
             dataset_bundle=dataset_bundle,
             methods=args.methods,
-            device=device
+            device=device,
+            eval_metrics = ["accuracy", "f1", "precision", "recall"]
         )
         trainer.train()
 
-        # Evaluate stats
+        # Evaluate on test set if available
+        if hasattr(dataset_bundle, 'test_dataset') and dataset_bundle.test_dataset is not None:
+            test_results = trainer.evaluate(dataset_bundle.test_dataset)
+            wandb.log({"test": test_results})
+            print(f"Test results: {test_results}")
+
+        # Get stats and evaluate
         stats = trainer.get_unified_stats()
-        evaluator = Evaluator(len(train_dataset), stats, percentile=args.percentile)
-        eval_dict = evaluator.binary_scores
+        # evaluator = Evaluator(len(train_dataset), stats, percentile=args.percentile)
+        # eval_dict = evaluator.binary_scores
 
         # Store binary scores with metadata
         eval_summary = {
@@ -204,27 +270,38 @@ def main():
                 "num_samples": len(train_dataset),
                 "methods": {}
             },
-            "binary_scores": eval_dict,
             "raw_scores": stats
         }
+
+        # "binary_scores": eval_dict,
 
         for method in args.methods:
             eval_summary["meta"]["methods"][method] = METHOD_METADATA.get(method, {})
 
-        with tempfile.NamedTemporaryFile(delete=False) as temp_file:
+        with tempfile.NamedTemporaryFile(delete=False, mode="wb") as temp_file:
             pickle.dump(eval_summary, temp_file)
             temp_file_path = temp_file.name
+            temp_file.flush()  # Make sure all the data is written to disk
+            temp_file.close() 
 
+        # Explicitly close or flush (this is now done by exiting the `with` block)
         artifact = wandb.Artifact(f"eval_summary_run{run_id}", type="pickle")
         artifact.add_file(temp_file_path, name=f"eval_summary_run{run_id}.pkl")
         wandb.run.log_artifact(artifact)
 
+        artifact.wait()  # <-- ensures artifact is fully uploaded
+
+
+        with open(temp_file_path, "rb") as f:
+            try:
+                loaded_data = pickle.load(f)
+                print("Pickle file loaded successfully, file seems valid")
+            except Exception as e:
+                print(f"Error loading pickle file: {e}")
+
         # Clean up the temporary file
         os.remove(temp_file_path)
-
-        # add sleep in case of machine latency
-        wandb.run.wait()
-
+        
         wandb.finish()
 
 if __name__ == "__main__":
