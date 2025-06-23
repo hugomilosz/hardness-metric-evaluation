@@ -2,307 +2,161 @@ import argparse
 import numpy as np
 import os
 import pickle
-import tempfile
-import time
+import random
+import yaml
 import torch
 import wandb
-import yaml
+from typing import List
 
-from evaluate import load
-from dataloader import DataLoader
-from evaluator import Evaluator
-from trainer import Trainer  # Import the new ImprovedTrainer
-from transformers import (
-    AutoModelForSequenceClassification,
-    TrainingArguments,
-)
+from dataloader import DataLoaderFactory
+from trainer import Trainer
 
-# python run.py \
-#   --model bert-tiny \
-#   --dataset multi_nli \
-#   --methods aum el2n loss \
-#   --epochs 3 \
-#   --batch_size 32 \
-#   --eval_batch_size 16 \
-#   --wandb_config wandb.yaml \
-#   --num_runs 10
-
-
-# Available options
-AVAILABLE_MODELS = [
-    "bert-tiny",
-    "bert-base",
-    "bert-large",
-    "roberta-base",
-    "roberta-large",
-    "xlnet-base",
-    "xlnet-large",
+AVAILABLE_MODELS: List[str] = [
+    "bert-tiny", "bert-base", "bert-large",
+    "roberta-base", "roberta-large",
+    "xlnet-base", "xlnet-large",
 ]
 
-AVAILABLE_DATASETS = [
-    "multi_nli",
-    "civilcomments_wilds",
-    "fever",
-    "qqp",
-    "toy",
+AVAILABLE_DATASETS: List[str] = [
+    "multi_nli", "civilcomments_wilds", "fever",
+    "qqp", "synthetic_mnli_labeled",
 ]
 
-AVAILABLE_METHODS = [
-    "aum",
-    "datamaps",
-    "el2n",
-    "loss",
-    "forgetting",
-    "grand",
-    "accuracy"
+AVAILABLE_METHODS: List[str] = [
+    "aum", "datamaps", "el2n",
+    "loss", "forgetting", "grand", "accuracy",
 ]
 
-MODEL_CONFIGS = {
-    "bert-tiny": {
-        "learning_rate": 5e-5,
-        "weight_decay": 0.01,
-        "warmup_ratio": 0.06,
-        "gradient_accumulation_steps": 1
-    },
-    "bert-base": {
-        "learning_rate": 3e-5,
-        "weight_decay": 0.01,
-        "warmup_ratio": 0.1,
-        "gradient_accumulation_steps": 2
-    },
-    "bert-large": {
-        "learning_rate": 2e-5,
-        "weight_decay": 0.02,
-        "warmup_ratio": 0.1,
-        "gradient_accumulation_steps": 4
-    },
-    "roberta-base": {
-        "learning_rate": 2e-5,
-        "weight_decay": 0.01,
-        "warmup_ratio": 0.06,
-        "gradient_accumulation_steps": 2
-    },
-    "roberta-large": {
-        "learning_rate": 1e-5,
-        "weight_decay": 0.01,
-        "warmup_ratio": 0.1,
-        "gradient_accumulation_steps": 4
-    },
-    "xlnet-base": {
-        "learning_rate": 2e-5,
-        "weight_decay": 0.01,
-        "warmup_ratio": 0.1,
-        "gradient_accumulation_steps": 2
-    },
-    "xlnet-large": {
-        "learning_rate": 1e-5,
-        "weight_decay": 0.02,
-        "warmup_ratio": 0.1,
-        "gradient_accumulation_steps": 4
-    }
-}
-
+# A dictionary containing metadata for each data selection method.
 METHOD_METADATA = {
     "aum": {
         "reference_source": "https://arxiv.org/pdf/2410.03429.pdf",
-        "conversion_method": (
-            "Training dynamics (confidence, variability, correctness, AUM) are extracted "
-            "across normal (Premise+Hypothesis) and hypothesis-only training runs. "
-            "A Gaussian Mixture Model (GMM) is fitted to cluster examples into difficulty levels, "
-            "avoiding manual thresholds. Based on extended Data Maps methodology."
-        ),
+        "conversion_method": "A Gaussian Mixture Model (GMM) is fitted to cluster examples into difficulty levels.",
     },
     "datamaps": {
         "reference_source": "https://arxiv.org/pdf/2009.10795.pdf",
-        "conversion_method": (
-            "Dataset divided into 3 equal-sized groups (easy, ambiguous, hard) "
-            "based on model learning dynamics (confidence, variability, correctness)."
-        ),
+        "conversion_method": "Dataset divided into easy, ambiguous, and hard groups based on confidence and variability.",
     },
     "el2n": {
         "reference_source": "https://arxiv.org/pdf/2211.05610.pdf",
-        "conversion_method": (
-            "Samples with EL2N (L2 norm between logits and labels) scores over "
-            "a threshold (default: top 20%) are labelled hard."
-        ),
+        "conversion_method": "Samples with EL2N scores over a percentile threshold are labelled hard.",
     },
     "forgetting": {
-        "reference_source": "",
-        "conversion_method": "Samples forgotten at least once (or never learned) are labelled hard."
+        "reference_source": "https://arxiv.org/pdf/1812.05159.pdf",
+        "conversion_method": "Samples forgotten at least once (or never learned) are labelled hard.",
     },
     "grand": {
         "reference_source": "https://arxiv.org/pdf/2211.05610.pdf",
-        "conversion_method": (
-            "Samples with GRAND (gradient norm) scores over "
-            "a threshold (default: top 20%) are labelled hard."
-        ),
+        "conversion_method": "Samples with GraND scores over a percentile threshold are labelled hard.",
     },
     "loss": {
         "reference_source": "https://arxiv.org/pdf/2007.06778",
-        "conversion_method": "Samples with highest loss (default: top 20%) are labelled hard."
+        "conversion_method": "Samples with the highest loss are labelled hard.",
     },
     "accuracy": {
-        "reference_source": "https://arxiv.org/pdf/2007.06778",
-        "conversion_method": "Samples with lowest accuracy (default: top 20%) are labelled hard."
+        "reference_source": None,
+        "conversion_method": "Samples with the lowest cumulative accuracy are labelled hard.",
     },
-    "regularisation": {
-        "reference_source": "https://arxiv.org/pdf/2107.09044.pdf",
-        "conversion_method": "Misclassified samples during training are labelled hard."
-    }
 }
 
-def parse_args():
-    parser = argparse.ArgumentParser(description="Train a transformer model and analyze using various data methods.")
-    parser.add_argument("--model", type=str, choices=AVAILABLE_MODELS, required=True, help="Model name")
-    parser.add_argument("--dataset", type=str, choices=AVAILABLE_DATASETS, required=True, help="Dataset name")
-    parser.add_argument("--methods", nargs="+", choices=AVAILABLE_METHODS, required=True, help="List of methods")
-    parser.add_argument("--epochs", type=int, default=2, help="Number of training epochs")
-    parser.add_argument("--batch_size", type=int, default=32, help="Training batch size")
-    parser.add_argument("--eval_batch_size", type=int, default=16, help="Evaluation batch size")
-    parser.add_argument("--wandb_config", type=str, default=None, help="Path to wandb.yaml with API key and entity")
-    parser.add_argument("--num_runs", type=int, default=1, help="Number of repeated runs for training and evaluation")
-    parser.add_argument("--percentile", type=int, default=80, help="Percentile threshold for hard examples (used in applicable methods)")
+def parse_args() -> argparse.Namespace:
+    """Parses command-line arguments for the training script."""
+    parser = argparse.ArgumentParser(description="Train a transformer model and analyse its training dynamics.")
+    parser.add_argument("--model", type=str, choices=AVAILABLE_MODELS, required=True, help="Model architecture to use.")
+    parser.add_argument("--dataset", type=str, choices=AVAILABLE_DATASETS, required=True, help="Dataset to use for training and evaluation.")
+    parser.add_argument("--methods", nargs="+", choices=AVAILABLE_METHODS, required=True, help="List of data selection methods to analyse.")
+    parser.add_argument("--epochs", type=int, default=3, help="Number of training epochs.")
+    parser.add_argument("--num_runs", type=int, default=1, help="Number of times to repeat the experiment with different seeds.")
+    parser.add_argument("--wandb_config", type=str, default=None, help="Path to a wandb.yaml file with API key and entity.")
+    
+    # Hyperparameters
+    parser.add_argument("--batch_size", type=int, default=32, help="Training batch size.")
+    parser.add_argument("--eval_batch_size", type=int, default=16, help="Evaluation batch size.")
+    parser.add_argument("--learning_rate", type=float, default=2e-5, help="Peak learning rate for the optimiser.")
+    parser.add_argument("--weight_decay", type=float, default=0.01, help="Weight decay for the optimiser.")
+    parser.add_argument("--warmup_ratio", type=float, default=0.1, help="Proportion of training steps for linear warmup.")
+    parser.add_argument("--lr_scheduler_type", type=str, default="linear", choices=["linear", "cosine", "constant"], help="Learning rate scheduler type.")
+    parser.add_argument("--grad_acc_steps", type=int, default=1, help="Number of gradient accumulation steps.")
+    parser.add_argument("--percentile", type=int, default=80, help="Percentile threshold for identifying 'hard' examples.")
+    parser.add_argument("--beta1", type=float, default=0.9, help="AdamW beta1 parameter.")
+    parser.add_argument("--beta2", type=float, default=0.999, help="AdamW beta2 parameter.")
+    parser.add_argument("--eps", type=float, default=1e-8, help="AdamW epsilon parameter.")
+    
     return parser.parse_args()
-
-def compute_metrics(eval_pred):
-    metric = load("accuracy")
-    predictions, labels = eval_pred
-    predictions = np.argmax(predictions, axis=1)
-    return metric.compute(predictions=predictions, references=labels)
     
 def main():
-    torch.cuda.empty_cache()
+    """
+    Main function to orchestrate the training and evaluation process.
+    """
     args = parse_args()
 
     if args.wandb_config:
         with open(args.wandb_config, "r") as f:
-            wandb_creds = yaml.load(f, Loader=yaml.FullLoader)
-        os.environ["WANDB_API_KEY"] = wandb_creds["wandb_key"]
+            wandb_creds = yaml.safe_load(f)
+        os.environ["WANDB_API_KEY"] = wandb_creds.get("wandb_key")
+        os.environ["WANDB_ENTITY"] = wandb_creds.get("entity")
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Using device: {device}")
 
     for run_id in range(args.num_runs):
-        seed = 33 + run_id  # change seed for each run
+        # Generate a new random seed for each run for independent experiments.
+        seed = random.randint(0, 1_000_000)
         torch.manual_seed(seed)
         np.random.seed(seed)
+        random.seed(seed)
 
-        # Load dataset_bundle
-        data_loader = DataLoader(args.dataset, args.model)
+        print(f"\n--- Starting Run {run_id + 1}/{args.num_runs} (Seed: {seed}) ---")
+
+        # Initialise data loader and fetch all data components.
+        data_loader = DataLoaderFactory(args.dataset, args.model)
         dataset_bundle = data_loader.prepare_datasets()
-        train_dataset = dataset_bundle.train_dataset
-        eval_dataset = dataset_bundle.eval_dataset
-        num_labels = dataset_bundle.num_labels
 
-        # Use model configuration from MODEL_CONFIGS if available
-        model_config = MODEL_CONFIGS.get(args.model, {
-            "learning_rate": 2e-5,
-            "weight_decay": 0.01,
-            "warmup_ratio": 0.1,
-            "gradient_accumulation_steps": 1
-        })
-
-        # Training arguments with model-specific settings
-        training_args = TrainingArguments(
-            output_dir=f"{args.model.replace('/', '-')}-{args.dataset}-run{run_id}",
-            learning_rate=model_config["learning_rate"],
-            per_device_train_batch_size=args.batch_size,
-            per_device_eval_batch_size=args.eval_batch_size,
-            num_train_epochs=args.epochs,
-            weight_decay=model_config["weight_decay"],
-            evaluation_strategy="epoch",
-            save_strategy="epoch",
-            fp16=torch.cuda.is_available(),
-            seed=seed,
-            report_to="none",
-            lr_scheduler_type="linear",
-            warmup_ratio=model_config["warmup_ratio"],
-            gradient_accumulation_steps=model_config["gradient_accumulation_steps"],
-        )
-
-        # Start wandb run
+        # Start a new W&B run for each experiment.
         wandb_run = wandb.init(
-            project=f"{args.model}_{args.dataset}_analysis",
-            name=f"{args.model.replace('/', '-')}_{args.dataset}_run{run_id}",
-            config={
-                "model": args.model,
-                "dataset": args.dataset,
-                "methods": args.methods,
-                "epochs": args.epochs,
-                "train_batch_size": args.batch_size,
-                "eval_batch_size": args.eval_batch_size,
-                "device": str(device),
-                "seed": seed,
-                **model_config,  # Include model-specific configs
-            },
+            project=f"{args.model.replace('/', '-')}-{args.dataset}-analysis",
+            name=f"run-{run_id+1}-seed-{seed}",
+            config=vars(args)
         )
-
-        # Create model
-        model = dataset_bundle.model
-
-        # Use the new ImprovedTrainer
+        
+        # The Trainer handles the main training loop.
         trainer = Trainer(
-            args=training_args,
+            args=args,
             dataset_bundle=dataset_bundle,
             methods=args.methods,
-            device=device,
-            eval_metrics = ["accuracy", "f1", "precision", "recall"]
+            eval_metrics=["accuracy", "f1", "precision", "recall"]
         )
         trainer.train()
 
-        # Evaluate on test set if available
-        if hasattr(dataset_bundle, 'test_dataset') and dataset_bundle.test_dataset is not None:
-            test_results = trainer.evaluate(dataset_bundle.test_dataset)
-            wandb.log({"test": test_results})
-            print(f"Test results: {test_results}")
-
-        # Get stats and evaluate
+        # After training, get all the raw statistics.
         stats = trainer.get_unified_stats()
-        # evaluator = Evaluator(len(train_dataset), stats, percentile=args.percentile)
-        # eval_dict = evaluator.binary_scores
-
-        # Store binary scores with metadata
-        eval_summary = {
+        
+        # Prepare a summary dictionary for logging as a W&B artifact.
+        summary_artifact = {
             "meta": {
                 "dataset": args.dataset,
                 "model": args.model,
                 "num_epochs": args.epochs,
-                "num_samples": len(train_dataset),
-                "methods": {}
+                "num_samples": len(dataset_bundle.train_dataset),
+                "seed": seed,
+                "methods": {m: METHOD_METADATA.get(m, {}) for m in args.methods}
             },
-            "raw_scores": stats
+            "raw_scores": stats,
         }
-
-        # "binary_scores": eval_dict,
-
-        for method in args.methods:
-            eval_summary["meta"]["methods"][method] = METHOD_METADATA.get(method, {})
-
-        with tempfile.NamedTemporaryFile(delete=False, mode="wb") as temp_file:
-            pickle.dump(eval_summary, temp_file)
-            temp_file_path = temp_file.name
-            temp_file.flush()  # Make sure all the data is written to disk
-            temp_file.close() 
-
-        # Explicitly close or flush (this is now done by exiting the `with` block)
-        artifact = wandb.Artifact(f"eval_summary_run{run_id}", type="pickle")
-        artifact.add_file(temp_file_path, name=f"eval_summary_run{run_id}.pkl")
-        wandb.run.log_artifact(artifact)
-
-        artifact.wait()  # <-- ensures artifact is fully uploaded
-
-
-        with open(temp_file_path, "rb") as f:
-            try:
-                loaded_data = pickle.load(f)
-                print("Pickle file loaded successfully, file seems valid")
-            except Exception as e:
-                print(f"Error loading pickle file: {e}")
-
-        # Clean up the temporary file
-        os.remove(temp_file_path)
+        
+        # Save the summary as a pickle file and log it as a W&B artifact.
+        artifact_name = f"summary_run_{run_id+1}"
+        with open(f"{artifact_name}.pkl", "wb") as f:
+            pickle.dump(summary_artifact, f)
+        
+        artifact = wandb.Artifact(artifact_name, type="analysis_results")
+        artifact.add_file(f"{artifact_name}.pkl")
+        wandb_run.log_artifact(artifact)
         
         wandb.finish()
+        
+        # Clean up the local pickle file after logging.
+        os.remove(f"{artifact_name}.pkl")
 
 if __name__ == "__main__":
     main()
