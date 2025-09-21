@@ -39,7 +39,7 @@ class ScoreRanker:
         for epoch_scores in aum_scores:
             scores = np.array(epoch_scores, dtype=float)
             scores[np.isnan(scores)] = -np.inf # Treat NaNs as infinitely hard.
-            ranked_indices = np.argsort(-scores) # Sort descending (easy to hard).
+            ranked_indices = np.argsort(-scores)
             ranked_indices_over_epochs.append(ranked_indices)
         return ranked_indices_over_epochs
 
@@ -49,7 +49,7 @@ class ScoreRanker:
         for epoch_scores in el2n_scores:
             scores = np.array(epoch_scores, dtype=float)
             scores[np.isnan(scores)] = np.inf # Treat NaNs as infinitely hard.
-            ranked_indices = np.argsort(scores) # Sort ascending (easy to hard).
+            ranked_indices = np.argsort(scores)
             ranked_indices_over_epochs.append(ranked_indices)
         return ranked_indices_over_epochs
 
@@ -81,7 +81,7 @@ class ScoreRanker:
             conf = np.array(conf_epoch, dtype=float)
             var = np.array(var_epoch, dtype=float)
             
-            composite_score = var - conf # Lower is easier (high confidence, low variability).
+            composite_score = var - conf
             composite_score[np.isnan(composite_score)] = np.inf
             
             ranked_indices = np.argsort(composite_score)
@@ -96,7 +96,6 @@ class ScoreRanker:
         ranked_indices_over_epochs = []
         for forgetting_counts in forgetting_scores:
             scores = np.array(forgetting_counts, dtype=float)
-            # Find a value larger than any real count to represent 'never learned'.
             hardest_val = np.max(scores[scores != -1]) + 1 if np.any(scores != -1) else 1
             scores[scores == -1] = hardest_val
             
@@ -107,12 +106,14 @@ class ScoreRanker:
     def _rank_by_accuracy(self, accuracy_scores: np.ndarray) -> list:
         """Ranks by cumulative accuracy over epochs, where lower accuracy is harder."""
         ranked_indices_over_epochs = []
+        cumulative_sum = np.zeros(accuracy_scores.shape[1], dtype=float)
+        
         for epoch_idx in range(len(accuracy_scores)):
-            # Calculate mean accuracy up to the current epoch.
-            cumulative_data = accuracy_scores[:epoch_idx + 1]
-            avg_accuracy = np.nanmean(cumulative_data, axis=0)
-            avg_accuracy[np.isnan(avg_accuracy)] = -np.inf # Treat NaNs as infinitely hard.
+            # Add the current epoch's scores to the running sum
+            cumulative_sum += np.nan_to_num(accuracy_scores[epoch_idx])
+            avg_accuracy = cumulative_sum / (epoch_idx + 1)
             
-            ranked_indices = np.argsort(-avg_accuracy) # Sort descending (easy to hard).
+            avg_accuracy[np.isnan(avg_accuracy)] = -np.inf
+            ranked_indices = np.argsort(-avg_accuracy)
             ranked_indices_over_epochs.append(ranked_indices)
         return ranked_indices_over_epochs

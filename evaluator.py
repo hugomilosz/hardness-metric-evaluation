@@ -6,202 +6,148 @@ class Evaluator:
     def __init__(self, total_samples, stats, percentile=80):
         self.total_samples = total_samples
         self.scores_by_method = {}
-        self.percentile = percentile
-
-        # Storage for binary difficulty labels
         self.binary_scores = {}
         self._evaluate(stats)
 
     def _evaluate(self, stats):
-        # AUM
         if "aum" in stats and "datamap" in stats:
-            aum_scores = stats["aum"]["sample_margins"]
-            confidence_scores = stats["datamap"]["confidence"]
-            variability_scores = stats["datamap"]["variability"]
-            correctness_scores = stats["datamap"]["correctness"]
-            self.binary_scores["aum"] = self._binary_from_aum(aum_scores, confidence_scores, variability_scores, correctness_scores)
-            self.binary_scores["datamap"] = self._binary_from_datamap(confidence_scores, variability_scores, correctness_scores)
-
-        # EL2N
+            self.binary_scores["aum"] = self._binary_from_aum(stats["aum"])
+            self.binary_scores["datamap"] = self._binary_from_datamap(stats["datamap"])
         if "el2n" in stats:
-            el2n_scores = stats["el2n"]
-            self.binary_scores["el2n"] = self._binary_from_el2n(el2n_scores)
-
-        # GraNd
+            self.binary_scores["el2n"] = self._binary_from_el2n(stats["el2n"])
         if "grand" in stats:
-            grand_scores = stats["grand"]
-            self.binary_scores["grand"] = self._binary_from_grand(grand_scores)
-
-        # Loss
+            self.binary_scores["grand"] = self._binary_from_grand(stats["grand"])
         if "loss" in stats:
-            loss = stats["loss"]["all_losses"]
-            self.binary_scores["loss"] = self._binary_from_loss(loss)
-
-        # Forgetting
+            self.binary_scores["loss"] = self._binary_from_loss(stats["loss"])
         if "forgetting" in stats:
-            forgetting = stats["forgetting"]["epoch_history"]
-            self.binary_scores["forgetting"] = self._binary_from_forgetting(forgetting)
-
-        # Regularisation
+            self.binary_scores["forgetting"] = self._binary_from_forgetting(stats["forgetting"])
         if "regularisation" in stats:
             self.binary_scores["regularisation"] = stats["regularisation"]
+        if "predictions" in stats and "true_labels" in stats:
+            predictions = np.array(stats['predictions'])
+            true_labels = np.array(stats['true_labels'])
+            accuracy_scores = (predictions == true_labels).astype(int)
+            self.binary_scores["accuracy"] = self._binary_from_accuracy(accuracy_scores)
 
-        if "accuracy" in stats:
-            accuracy = stats["accuracy"]
-            # all_accuracies = []
-            # for epoch_preds in stats['predictions']:
-            #     correct = (np.array(epoch_preds) == np.array(stats['true_labels'])).astype(float)
-            #     all_accuracies.append(correct)
-            self.binary_scores["accuracy"] = self._binary_from_accuracy(accuracy)
-
-    def _binary_from_aum(self, aum_scores, confidence_scores, variability_scores, correctness_scores):
-        if any(x is None for x in [aum_scores, confidence_scores, variability_scores, correctness_scores]):
-            raise ValueError("Missing one or more required features: AUM, confidence, variability, correctness")
-
-        sample_ids = sorted(aum_scores.keys())
-        aum_array = np.array([aum_scores[sid] for sid in sample_ids])
-        aum_array = np.transpose(aum_array)
-
-        num_epochs = aum_array.shape[0]
+    # 67% examples are labelled as HARD (Follows Dataset Cartograpy)
+    def _binary_from_aum(self, aum_scores):
         binary_labels_over_epochs = []
-
-        for epoch_idx in range(num_epochs):
-            aum = np.nanmean(aum_array[:epoch_idx + 1], axis=0)
-
-            conf = confidence_scores[epoch_idx]
-            var = variability_scores[epoch_idx]
-            corr = correctness_scores[epoch_idx]
-
-            features = np.stack([aum, conf, var, corr], axis=1)
-            valid_mask = ~np.isnan(features).any(axis=1)
-            valid_features = features[valid_mask]
-
-            scaler = StandardScaler()
-            norm_features = scaler.fit_transform(valid_features)
-
-            gmm = GaussianMixture(n_components=3, random_state=42)
-            cluster_labels = gmm.fit_predict(norm_features)
-
-            conf_valid = conf[valid_mask]
-            cluster_conf_means = [conf_valid[cluster_labels == i].mean() for i in range(3)]
-            hard_cluster = int(np.argmin(cluster_conf_means))
-
-            binary_valid = (cluster_labels == hard_cluster).astype(int)
-
-            binary_labels = np.zeros(len(conf), dtype=int)
-            binary_labels[valid_mask] = binary_valid
+        for epoch_scores in aum_scores:
+            current_scores = np.array(epoch_scores, dtype=float)
+            if current_scores.size == 0: continue
+            valid_scores = current_scores[~np.isnan(current_scores)]
+            if valid_scores.size == 0:
+                binary_labels_over_epochs.append(np.zeros_like(current_scores, dtype=int))
+                continue
+            # Labels HARD and AMBIGUOUS examples as hard - below 67th percentile
+            threshold = np.percentile(valid_scores, 100*(2/3.0))
+            binary_labels = np.where(current_scores <= threshold, 1, 0)
             binary_labels_over_epochs.append(binary_labels)
+        return np.array(binary_labels_over_epochs, dtype=object)
 
-        return binary_labels_over_epochs
-
+    # 30% examples are labelled as HARD (as mentioned in paper)
     def _binary_from_el2n(self, el2n_scores):
-        num_epochs = len(el2n_scores)
-        el2n_array = np.array(el2n_scores)
         binary_labels_over_epochs = []
-
-        for epoch_idx in range(num_epochs):
-            current_scores = el2n_array[epoch_idx]
+        for epoch_scores in el2n_scores:
+            current_scores = np.array(epoch_scores, dtype=float)
+            if current_scores.size == 0: continue
             valid_scores = current_scores[~np.isnan(current_scores)]
-            threshold = np.percentile(valid_scores, self.percentile)
-
+            if valid_scores.size == 0:
+                binary_labels_over_epochs.append(np.zeros_like(current_scores, dtype=int)); continue
+            threshold = np.percentile(valid_scores, 70)
             binary_labels = np.where(current_scores >= threshold, 1, 0)
             binary_labels_over_epochs.append(binary_labels)
+        return np.array(binary_labels_over_epochs)
 
-        return binary_labels_over_epochs
-
-
+    # 30% examples are labelled as HARD (as mentioned in paper)
     def _binary_from_grand(self, grand_scores):
-        num_epochs = len(grand_scores)
-        grand_array = np.array(grand_scores)
         binary_labels_over_epochs = []
-
-        for epoch_idx in range(num_epochs):
-            current_scores = grand_array[epoch_idx]
+        for epoch_scores in grand_scores:
+            current_scores = np.array(epoch_scores, dtype=float)
+            if current_scores.size == 0: continue
             valid_scores = current_scores[~np.isnan(current_scores)]
-            threshold = np.percentile(valid_scores, self.percentile)
-
+            if valid_scores.size == 0:
+                binary_labels_over_epochs.append(np.zeros_like(current_scores, dtype=int)); continue
+            threshold = np.percentile(valid_scores, 70)
             binary_labels = np.where(current_scores >= threshold, 1, 0)
             binary_labels_over_epochs.append(binary_labels)
+        return np.array(binary_labels_over_epochs)
 
-        return binary_labels_over_epochs
-
+    # 30% examples are labelled as HARD
     def _binary_from_loss(self, loss_scores):
-        num_epochs = len(loss_scores)
-        loss_array = np.array(loss_scores)
         binary_labels_over_epochs = []
+        for epoch_loss_obj_array in loss_scores:
+            try:
+                current_loss = np.array([item[0] if item else np.nan for item in epoch_loss_obj_array], dtype=float)
+                
+                if current_loss.size == 0: continue
+                valid_scores = current_loss[~np.isnan(current_loss)]
+                if valid_scores.size == 0:
+                    binary_labels_over_epochs.append(np.zeros_like(current_loss, dtype=int)); continue
+                
+                threshold = np.percentile(valid_scores, 70)
+                binary_labels = np.where(current_loss >= threshold, 1, 0)
+                binary_labels_over_epochs.append(binary_labels)
+            except (TypeError, IndexError) as e:
+                print(f"Warning: Could not parse loss epoch data due to structure issue: {e}. Skipping epoch.")
+                continue
+        return np.array(binary_labels_over_epochs)
 
-        for epoch_idx in range(num_epochs):
-            current_loss = loss_array[epoch_idx]
-            valid_scores = current_loss[~np.isnan(current_loss)]
-            threshold = np.percentile(valid_scores, self.percentile)
-
-            binary_labels = np.where(current_loss >= threshold, 1, 0)
-            binary_labels_over_epochs.append(binary_labels)
-
-        return binary_labels_over_epochs
-
-    def _binary_from_datamap(self, confidence_scores, variability_scores, correctness_scores):
-        if any(x is None for x in [confidence_scores, variability_scores, correctness_scores]):
-            raise ValueError("Missing one or more required Data Maps features.")
-
-        confidence_scores = np.array(confidence_scores)
-        variability_scores = np.array(variability_scores)
-        correctness_scores = np.array(correctness_scores)
-        num_epochs = confidence_scores.shape[0]
+    # 67% examples are labelled as HARD
+    def _binary_from_datamap(self, datamap_stats):
+        """
+        Labels hard-to-learn AND ambiguous examples as hard
+        """
+        confidence_scores = datamap_stats['confidence']
+        variability_scores = datamap_stats['variability']
+        
         binary_labels_over_epochs = []
+        for epoch_idx in range(len(confidence_scores)):
+            conf = np.array(confidence_scores[epoch_idx], dtype=float)
+            var = np.array(variability_scores[epoch_idx], dtype=float)
 
-        for epoch_idx in range(num_epochs):
-            conf = confidence_scores[epoch_idx]
-            var = variability_scores[epoch_idx]
-            corr = correctness_scores[epoch_idx]
+            binary_labels = np.ones_like(conf, dtype=int)
 
-            valid_mask = ~np.isnan(conf) & ~np.isnan(var) & ~np.isnan(corr)
-            num_valid = valid_mask.sum()
-            binary_labels = np.ones_like(conf, dtype=int)  # Default all to hard (1)
+            variability_threshold = np.percentile(var, 100 * (2/3.0))
+            low_variability_mask = var < variability_threshold
 
-            if num_valid == 0:
+            low_var_confidence_scores = conf[low_variability_mask]
+            if low_var_confidence_scores.size == 0:
                 binary_labels_over_epochs.append(binary_labels)
                 continue
-
-            # High confidence, low variability = easier
-            # We subtract var to make lower variability increase the score
-            ease_score = conf[valid_mask] - var[valid_mask]
-
-            # Get threshold to label bottom 33% as easy
-            threshold = np.percentile(ease_score, 33)
-            easy_indices = np.where(valid_mask)[0][ease_score <= threshold]
-            binary_labels[easy_indices] = 0
+            
+            confidence_threshold = np.median(low_var_confidence_scores)
+            hard_to_learn_mask = low_variability_mask & (conf > confidence_threshold)
+            binary_labels[hard_to_learn_mask] = 0
+            
             binary_labels_over_epochs.append(binary_labels)
+            
+        return np.array(binary_labels_over_epochs)
 
-        return binary_labels_over_epochs
-
-    def _binary_from_forgetting(self, forgetting):
+    # Forgotten or Never Learned Examples labelled as HARD
+    def _binary_from_forgetting(self, forgetting_scores):
         binary_labels_over_epochs = []
-
-        for forgetting_counts in forgetting:
+        for forgetting_counts in forgetting_scores:
             counts = np.array(forgetting_counts)
-            # Hard if never learned (-1) or forgotten (>=1)
             binary_labels = np.where((counts == -1) | (counts >= 1), 1, 0)
             binary_labels_over_epochs.append(binary_labels)
+        return np.array(binary_labels_over_epochs)
 
-        return binary_labels_over_epochs
-
-    def _binary_from_regularisation(self):
-        return self.scores_by_method.get("regularisation")
-
+    # 30% examples are labelled as HARD
     def _binary_from_accuracy(self, accuracy_scores):
-        num_epochs = len(accuracy_scores)
-        accuracy_array = np.array(accuracy_scores)  # Shape: [num_epochs, num_samples]
         binary_labels_over_epochs = []
-
-        for epoch_idx in range(num_epochs):
-            current_scores = accuracy_array[:epoch_idx + 1]
-            avg_accuracy = np.mean(current_scores, axis=0)
+        for epoch_idx, epoch_data in enumerate(accuracy_scores):
+            # Process cumulative accuracy up to the current epoch
+            cumulative_data = accuracy_scores[:epoch_idx + 1]
+            max_len = max(len(row) for row in cumulative_data)
+            padded_data = np.full((len(cumulative_data), max_len), np.nan, dtype=float)
+            for i, row in enumerate(cumulative_data):
+                padded_data[i, :len(row)] = row
+            avg_accuracy = np.nanmean(padded_data, axis=0)
             valid_scores = avg_accuracy[~np.isnan(avg_accuracy)]
-            threshold = np.percentile(valid_scores, 100 - self.percentile)  # Low accuracy = hard
-
+            if valid_scores.size == 0:
+                binary_labels_over_epochs.append(np.zeros_like(avg_accuracy, dtype=int)); continue
+            threshold = np.percentile(valid_scores, 30)
             binary_labels = np.where(avg_accuracy <= threshold, 1, 0)
             binary_labels_over_epochs.append(binary_labels)
-
-        return binary_labels_over_epochs
-
+        return np.array(binary_labels_over_epochs)
